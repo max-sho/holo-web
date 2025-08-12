@@ -3,17 +3,17 @@
   <head>
     <title>Hologram — Core + Dynamic Points (WebXR)</title>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1, user-scalable=no"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
     <style>
       html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Monospace}
       #info{position:absolute;top:10px;left:0;right:0;text-align:center;z-index:100;text-shadow:0 0 5px #000;pointer-events:none}
       #container{width:100vw;height:100vh}
     </style>
-    <!-- Inline defaults so the page works immediately; Vercel envs can override -->
+
+    <!-- defaults so it works right now; env/config can override later -->
     <script>
-      window.ASSET_BASE_URL = window.ASSET_BASE_URL ||
-        "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
-      window.TRACK_ID = window.TRACK_ID || "demo_v1";
+      window.ASSET_BASE_URL = window.ASSET_BASE_URL || "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
+      window.TRACK_ID       = window.TRACK_ID       || "demo_v1";
     </script>
 
     <!-- three.js + addons -->
@@ -40,15 +40,14 @@
       import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
       import { OculusHandModel } from "three/addons/webxr/OculusHandModel.js";
       import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
-      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
       import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
-      // ----- CONFIG -----
+      // ------- CONFIG -------
       const ASSET_BASE_URL = (window.ASSET_BASE_URL || "").trim();
       const TRACK_ID = (window.TRACK_ID || "").trim();
       const manifestUrl = `${ASSET_BASE_URL}/${TRACK_ID}/manifest.json`;
 
-      // ----- SCENE -----
+      // ------- GLOBALS -------
       let scene, camera, renderer, controls, mainScene;
       let corePoints=null, coreMat=null, dynPoints=null, dynMat=null;
       let gpuCompute=null, positionVar=null, gpgpuPts=null, gpgpuMat=null;
@@ -64,23 +63,22 @@
       // audio (optional)
       let audioCtx=null, audioBuf=null, src=null, playing=false, muted=true, t0=0, pausedAt=0;
 
-      // UI params
       const params={
         size: 2.0,
-        coreOpacity: 1.0,
+        coreOpacity: 0.4,
         dynOpacity: 0.35,
-        showFX: true,
+        showFX: false,
         fxLife: 5.0, fxSpeed: 40.0, fxOpacity: 0.25,
         curlAmp: 40.0, curlFreq: 0.005,
-        handForce: -220.0, handRadius: 0.5,
         additive: true,
         playPause: ()=>{}, mute: ()=>{}
       };
 
-      // ----- UTIL -----
+      // ------- UTILS -------
       async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
       async function b(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.arrayBuffer(); }
 
+      // float16 -> float32 converter
       function f16_to_f32(h){ const s=(h&0x8000)>>15,e=(h&0x7C00)>>10,f=h&0x03FF;
         if(!e) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
         if(e===31) return f?NaN:((s?-1:1)*Infinity);
@@ -88,17 +86,19 @@
       }
       function convertF16Block(u16, out){ for(let i=0;i<u16.length;i++) out[i]=f16_to_f32(u16[i]); return out; }
 
-      function texRGB32F(arr, count){
-        const t=new THREE.DataTexture(new Float32Array(arr.buffer), count, 1, THREE.RGBFormat, THREE.FloatType);
+      // RGBA float texture (more compatible than RGB32F)
+      function texRGBA32F_fromRGBArray(arr, count){
+        const rgba = new Float32Array(count * 4);
+        for (let i=0, j=0; i<count*3; i+=3, j+=4) {
+          rgba[j]=arr[i]; rgba[j+1]=arr[i+1]; rgba[j+2]=arr[i+2]; rgba[j+3]=1.0;
+        }
+        const t = new THREE.DataTexture(rgba, count, 1, THREE.RGBAFormat, THREE.FloatType);
         t.needsUpdate=true; t.magFilter=t.minFilter=THREE.NearestFilter; t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping; return t;
       }
-      function texRGB8(u8, count){
-        const t=new THREE.DataTexture(new Uint8Array(u8), count, 1, THREE.RGBFormat, THREE.UnsignedByteType);
-        t.needsUpdate=true; t.magFilter=t.minFilter=THREE.NearestFilter; t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping; return t;
-      }
+
       function idsGeom(count){ const g=new THREE.BufferGeometry(); const ids=new Float32Array(count); for(let i=0;i<count;i++) ids[i]=i; g.setAttribute("a_id", new THREE.BufferAttribute(ids,1)); return g; }
 
-      // ----- SHADERS -----
+      // ------- SHADERS -------
       const dynVS=`
         attribute float a_id;
         uniform sampler2D u_positions;
@@ -107,7 +107,7 @@
         varying float v_id;
         void main(){
           float u=(a_id+0.5)/u_n;
-          vec3 pN=texture2D(u_positions, vec2(u,0.5)).rgb;
+          vec3 pN=texture2D(u_positions, vec2(u,0.5)).rgb;   // ignore A
           vec3 p=u_off + u_scale * pN;
           vec4 v=viewMatrix*vec4(p,1.0);
           gl_Position=projectionMatrix*v;
@@ -129,26 +129,43 @@
           float s=length(vec3(modelMatrix[0])); gl_PointSize=u_size*s*(1.0/-v.z); v_c=color; }`;
       const coreFS=`uniform float u_opacity; varying vec3 v_c; void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; gl_FragColor=vec4(v_c,u_opacity);} `;
 
-      // ----- LOADERS -----
+      // ------- LOADERS -------
       async function loadCore(m){
         const url=`${ASSET_BASE_URL}/${TRACK_ID}/${m.staticCore.url}`;
-        if(url.endsWith(".ply.gz")){
-          const ab=await b(url); const inflated=pako.inflate(new Uint8Array(ab));
-          const g=new PLYLoader().parse(inflated.buffer);
-          if(g.getAttribute("color")){ const c=g.getAttribute("color").array; for(let i=0;i<c.length;i++) c[i]/=255.0; }
-          else{ const n=g.getAttribute("position").count; const cols=new Float32Array(n*3); cols.fill(1); g.setAttribute("color", new THREE.BufferAttribute(cols,3)); }
-          coreMat=new THREE.ShaderMaterial({uniforms:{u_size:{value:params.size}, u_opacity:{value:params.coreOpacity}}, vertexShader:coreVS, fragmentShader:coreFS, transparent:true, depthWrite:false});
-          const pts=new THREE.Points(g,coreMat); pts.frustumCulled=false; return pts;
+        if (!url.endsWith(".ply.gz")) throw new Error("Unsupported core format: " + url);
+
+        const ab = await b(url);
+        const inflated = pako.inflate(new Uint8Array(ab));
+        const text = new TextDecoder().decode(inflated);     // ASCII PLY
+        const g = new PLYLoader().parse(text);
+
+        // normalize colors to Float32 [0..1]
+        const colAttr = g.getAttribute("color");
+        if (colAttr && colAttr.array instanceof Uint8Array) {
+          const n = colAttr.count; const f = new Float32Array(n*3);
+          for (let i=0;i<n*3;i++) f[i]=colAttr.array[i]/255;
+          g.setAttribute("color", new THREE.BufferAttribute(f,3));
+        } else if (!colAttr) {
+          const n = g.getAttribute("position").count;
+          const ones = new Float32Array(n*3); ones.fill(1);
+          g.setAttribute("color", new THREE.BufferAttribute(ones,3));
         }
-        throw new Error("Unsupported core format");
+
+        coreMat = new THREE.ShaderMaterial({
+          uniforms:{ u_size:{value:params.size}, u_opacity:{value:params.coreOpacity} },
+          vertexShader: coreVS, fragmentShader: coreFS, transparent:true, depthWrite:false
+        });
+        const pts = new THREE.Points(g, coreMat); pts.frustumCulled=false;
+        return pts;
       }
 
       async function loadChunk(path){
         header = await j(`${ASSET_BASE_URL}/${TRACK_ID}/${path}header.json`);
-        fps=header.fps; numFrames=header.numFrames; numPoints=header.numPoints;
+        fps=header.fps|0; numFrames=header.numFrames|0; numPoints=header.numPoints|0;
         qOff.set(...header.quant.offset); qScale.set(...header.quant.scale);
-        stridePos=numPoints*3*2; strideCol=numPoints*3;
 
+        stridePos=numPoints*3*2;   // float16 xyz
+        strideCol=numPoints*3;     // u8 xyz
         [posBuf,colBuf] = await Promise.all([
           b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}positions.bin`),
           b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}colors.bin`)
@@ -166,6 +183,7 @@
           transparent:true, depthWrite:false
         });
         dynPoints=new THREE.Points(geom,dynMat); dynPoints.frustumCulled=false;
+
         updateFrameTextures(0);
         dynMat.uniforms.u_positions.value=dtPos;
         dynMat.uniforms.u_colors.value=dtCol;
@@ -175,14 +193,26 @@
       function updateFrameTextures(i){
         const u16 = new Uint16Array(posBuf, i*stridePos, numPoints*3);
         const u8  = new Uint8Array (colBuf, i*strideCol, numPoints*3);
+
         convertF16Block(u16, tmpPosF32);
-        if(!dtPos) dtPos=texRGB32F(tmpPosF32, numPoints);
-        else { dtPos.image.data.set(new Float32Array(tmpPosF32.buffer)); dtPos.needsUpdate=true; }
-        if(!dtCol) dtCol=texRGB8(u8, numPoints);
-        else { dtCol.image.data.set(new Uint8Array(u8)); dtCol.needsUpdate=true; }
+        if(!dtPos) dtPos = texRGBA32F_fromRGBArray(tmpPosF32, numPoints);
+        else {
+          const rgba = dtPos.image.data; // Float32Array len = numPoints*4
+          for (let p=0,q=0; p<numPoints*3; p+=3, q+=4) {
+            rgba[q]=tmpPosF32[p]; rgba[q+1]=tmpPosF32[p+1]; rgba[q+2]=tmpPosF32[p+2]; rgba[q+3]=1.0;
+          }
+          dtPos.needsUpdate=true;
+        }
+
+        if(!dtCol){
+          dtCol=new THREE.DataTexture(new Uint8Array(u8), numPoints, 1, THREE.RGBFormat, THREE.UnsignedByteType);
+          dtCol.needsUpdate=true; dtCol.magFilter=dtCol.minFilter=THREE.NearestFilter; dtCol.wrapS=dtCol.wrapT=THREE.ClampToEdgeWrapping;
+        } else {
+          dtCol.image.data.set(new Uint8Array(u8)); dtCol.needsUpdate=true;
+        }
       }
 
-      // ----- AUDIO (optional) -----
+      // ------- AUDIO -------
       async function loadAudio(url){
         try{
           if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
@@ -198,7 +228,7 @@
       function pause(){ if(src){ try{src.stop();}catch{} src.disconnect(); src=null; } if(audioCtx) pausedAt=currentTime(); playing=false; }
       function currentTime(){ return audioCtx ? (playing ? audioCtx.currentTime - t0 : pausedAt) : 0; }
 
-      // ----- FX (lightweight GPGPU seeds from current dyn positions) -----
+      // ------- LIGHT FX (optional) -------
       function initFX(){
         gpuCompute = new GPUComputationRenderer(numPoints, 1, renderer);
         if(renderer.capabilities.isWebGL2===false) gpuCompute.setDataType(THREE.HalfFloatType);
@@ -213,7 +243,7 @@
 
         gpgpuMat=new THREE.ShaderMaterial({
           uniforms:{ u_positions:{value:gpuCompute.getCurrentRenderTarget(positionVar).texture}, u_size:{value:params.size}, u_opacity:{value:params.fxOpacity}, u_n:{value:numPoints} },
-          vertexShader: dynVS.replace("u_off + u_scale * pN","pN").replace("u_positions","u_positions"),
+          vertexShader: dynVS.replace("u_off + u_scale * pN","pN"),
           fragmentShader: `uniform float u_opacity; void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; gl_FragColor=vec4(1.,1.,1.,u_opacity); }`,
           transparent:true, depthWrite:false,
           blending: params.additive ? THREE.AdditiveBlending : THREE.NormalBlending
@@ -247,7 +277,7 @@
           }`;
       }
 
-      // ----- SCENE/GUI SETUP -----
+      // ------- SCENE / GUI -------
       function setupScene(){
         const container=document.getElementById("container");
         scene=new THREE.Scene();
@@ -279,7 +309,8 @@
         fx.open(); pb.open();
       }
 
-      // ----- TIMELINE / LOOP -----
+      // ------- TIMELINE / LOOP -------
+      function currentTime(){ return audioCtx ? (playing ? audioCtx.currentTime - t0 : pausedAt) : performance.now()*0.001; }
       function frameIdx(){ if(!header) return 0; const t=currentTime(); return Math.floor(t*fps)%Math.max(1,numFrames); }
       const clock=new THREE.Clock(); let last=0;
       function animate(){
@@ -294,16 +325,24 @@
         renderer.render(scene,camera);
       }
 
-      // ----- BOOT -----
+      // ------- BOOT -------
       (async function main(){
         setupScene(); setupGUI();
         const manifest = await j(manifestUrl);
         corePoints = await loadCore(manifest); mainScene.add(corePoints);
-        dynPoints = await loadChunk(manifest.dynamic.chunks[0].path); mainScene.add(dynPoints);
+        dynPoints  = await loadChunk(manifest.dynamic.chunks[0].path); mainScene.add(dynPoints);
         await loadAudio(`${ASSET_BASE_URL}/${TRACK_ID}/${manifest.audio.url}`);
+        // init FX after dyn textures exist
         initFX();
+        // helpful: increase default point size to notice small clouds
+        params.size = 1300; if(coreMat) coreMat.uniforms.u_size.value=params.size; if(dynMat) dynMat.uniforms.u_size.value=params.size;
         renderer.setAnimationLoop(animate);
-      })().catch(err=>{ console.error(err); const m=document.createElement('div'); m.style.position='absolute'; m.style.top='50%'; m.style.left='50%'; m.style.transform='translate(-50%,-50%)'; m.style.color='#fff'; m.style.font='14px monospace'; m.textContent='Error: '+err.message; document.body.appendChild(m);});
+      })().catch(err=>{
+        console.error(err);
+        const m=document.createElement('div'); m.style.position='absolute'; m.style.top='50%'; m.style.left='50%';
+        m.style.transform='translate(-50%,-50%)'; m.style.color='#fff'; m.style.font='14px monospace';
+        m.textContent='Error: '+err.message; document.body.appendChild(m);
+      });
     </script>
   </body>
 </html>

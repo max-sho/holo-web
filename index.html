@@ -8,23 +8,24 @@
       html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Monospace}
       #info{position:absolute;top:10px;left:0;right:0;text-align:center;z-index:100;text-shadow:0 0 5px #000;pointer-events:none}
       #container{width:100vw;height:100vh}
+      #err{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);max-width:90%;color:#f66;font:13px/1.4 monospace;white-space:pre-wrap}
     </style>
 
-    <!-- defaults so it works right now; env/config can override later -->
+    <!-- defaults so it works right now; config/env can override later -->
     <script>
       window.ASSET_BASE_URL = window.ASSET_BASE_URL || "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
       window.TRACK_ID       = window.TRACK_ID       || "demo_v1";
+      window.addEventListener('error', e => {
+        const d=document.createElement('div'); d.id='err'; d.textContent='JS Error: '+ (e.error?.stack || e.message);
+        document.body.appendChild(d);
+      });
+      window.addEventListener('unhandledrejection', e => {
+        const d=document.createElement('div'); d.id='err'; d.textContent='Promise Error: '+ (e.reason?.stack || e.reason);
+        document.body.appendChild(d);
+      });
     </script>
 
-    <!-- three.js + addons -->
-    <script type="importmap">
-      {
-        "imports": {
-          "three": "https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.module.js",
-          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/"
-        }
-      }
-    </script>
+    <!-- libs -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
   </head>
@@ -33,14 +34,15 @@
     <div id="info">Hologram — Preprocessed Points (Core + Dynamic) • WebXR • GPGPU FX</div>
     <div id="container"></div>
 
+    <!-- Use explicit module URLs (no import map) -->
     <script type="module">
-      import * as THREE from "three";
-      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-      import { XRButton } from "three/addons/webxr/XRButton.js";
-      import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
-      import { OculusHandModel } from "three/addons/webxr/OculusHandModel.js";
-      import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
-      import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+      import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.module.js";
+      import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/controls/OrbitControls.js";
+      import { XRButton } from "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/webxr/XRButton.js";
+      import { XRControllerModelFactory } from "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/webxr/XRControllerModelFactory.js";
+      import { OculusHandModel } from "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/webxr/OculusHandModel.js";
+      import { GPUComputationRenderer } from "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/misc/GPUComputationRenderer.js";
+      import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/loaders/PLYLoader.js";
 
       // ------- CONFIG -------
       const ASSET_BASE_URL = (window.ASSET_BASE_URL || "").trim();
@@ -64,9 +66,9 @@
       let audioCtx=null, audioBuf=null, src=null, playing=false, muted=true, t0=0, pausedAt=0;
 
       const params={
-        size: 2.0,
-        coreOpacity: 0.4,
-        dynOpacity: 0.35,
+        size: 1300.0,
+        coreOpacity: 0.6,
+        dynOpacity: 0.5,
         showFX: false,
         fxLife: 5.0, fxSpeed: 40.0, fxOpacity: 0.25,
         curlAmp: 40.0, curlFreq: 0.005,
@@ -78,7 +80,7 @@
       async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
       async function b(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.arrayBuffer(); }
 
-      // float16 -> float32 converter
+      // float16 -> float32
       function f16_to_f32(h){ const s=(h&0x8000)>>15,e=(h&0x7C00)>>10,f=h&0x03FF;
         if(!e) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
         if(e===31) return f?NaN:((s?-1:1)*Infinity);
@@ -86,7 +88,7 @@
       }
       function convertF16Block(u16, out){ for(let i=0;i<u16.length;i++) out[i]=f16_to_f32(u16[i]); return out; }
 
-      // RGBA float texture (more compatible than RGB32F)
+      // RGBA float texture (broader GPU support)
       function texRGBA32F_fromRGBArray(arr, count){
         const rgba = new Float32Array(count * 4);
         for (let i=0, j=0; i<count*3; i+=3, j+=4) {
@@ -107,7 +109,7 @@
         varying float v_id;
         void main(){
           float u=(a_id+0.5)/u_n;
-          vec3 pN=texture2D(u_positions, vec2(u,0.5)).rgb;   // ignore A
+          vec3 pN=texture2D(u_positions, vec2(u,0.5)).rgb;
           vec3 p=u_off + u_scale * pN;
           vec4 v=viewMatrix*vec4(p,1.0);
           gl_Position=projectionMatrix*v;
@@ -132,14 +134,12 @@
       // ------- LOADERS -------
       async function loadCore(m){
         const url=`${ASSET_BASE_URL}/${TRACK_ID}/${m.staticCore.url}`;
-        if (!url.endsWith(".ply.gz")) throw new Error("Unsupported core format: " + url);
-
         const ab = await b(url);
         const inflated = pako.inflate(new Uint8Array(ab));
         const text = new TextDecoder().decode(inflated);     // ASCII PLY
         const g = new PLYLoader().parse(text);
 
-        // normalize colors to Float32 [0..1]
+        // normalize colors -> Float32 [0..1]
         const colAttr = g.getAttribute("color");
         if (colAttr && colAttr.array instanceof Uint8Array) {
           const n = colAttr.count; const f = new Float32Array(n*3);
@@ -226,7 +226,7 @@
           src.start(0, pausedAt); t0=audioCtx.currentTime - pausedAt; src.onended=()=>{ playing=false; pausedAt=0; };
         } t0=audioCtx?audioCtx.currentTime:0; playing=true; }
       function pause(){ if(src){ try{src.stop();}catch{} src.disconnect(); src=null; } if(audioCtx) pausedAt=currentTime(); playing=false; }
-      function currentTime(){ return audioCtx ? (playing ? audioCtx.currentTime - t0 : pausedAt) : 0; }
+      function currentTime(){ return audioCtx ? (playing ? audioCtx.currentTime - t0 : pausedAt) : performance.now()*0.001; }
 
       // ------- LIGHT FX (optional) -------
       function initFX(){
@@ -332,16 +332,11 @@
         corePoints = await loadCore(manifest); mainScene.add(corePoints);
         dynPoints  = await loadChunk(manifest.dynamic.chunks[0].path); mainScene.add(dynPoints);
         await loadAudio(`${ASSET_BASE_URL}/${TRACK_ID}/${manifest.audio.url}`);
-        // init FX after dyn textures exist
-        initFX();
-        // helpful: increase default point size to notice small clouds
-        params.size = 1300; if(coreMat) coreMat.uniforms.u_size.value=params.size; if(dynMat) dynMat.uniforms.u_size.value=params.size;
+        if (numPoints>0) initFX();
         renderer.setAnimationLoop(animate);
       })().catch(err=>{
-        console.error(err);
-        const m=document.createElement('div'); m.style.position='absolute'; m.style.top='50%'; m.style.left='50%';
-        m.style.transform='translate(-50%,-50%)'; m.style.color='#fff'; m.style.font='14px monospace';
-        m.textContent='Error: '+err.message; document.body.appendChild(m);
+        const d=document.createElement('div'); d.id='err'; d.textContent='Init Error: '+(err.stack||err.message);
+        document.body.appendChild(d); console.error(err);
       });
     </script>
   </body>

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Hologram — Core + Dynamic (Debug + GUI)</title>
+  <title>Hologram — Core + Dynamic (Debug + Baseline)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <style>
     html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Monospace}
@@ -24,7 +24,7 @@
   }
   </script>
 
-  <!-- Defaults (override via ?asset=&track=) -->
+  <!-- Defaults (override with ?asset=&track=) -->
   <script>
     window.ASSET_BASE_URL = "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
     window.TRACK_ID       = "demo_v1";
@@ -59,11 +59,7 @@
     // ---------- status log ----------
     const logEl=document.getElementById('log');
     const log=(m,ok=true)=>{ const s=document.createElement('div'); s.className=ok?'ok':'bad'; s.textContent=(ok?'✓ ':'✗ ')+m; logEl.appendChild(s); console[ok?'log':'warn'](m); };
-
-    if (!HTMLScriptElement.supports?.('importmap')) {
-      log('Browser lacks importmap support — use recent Chrome/Edge/Safari.', false);
-    }
-
+    if (!HTMLScriptElement.supports?.('importmap')) log('Browser lacks importmap support', false);
     log('boot');
 
     // ---------- modules ----------
@@ -80,6 +76,10 @@
     const TRACK_ID=(window.TRACK_ID||'').trim();
     const manifestUrl=`${ASSET_BASE_URL}/${TRACK_ID}/manifest.json`;
 
+    // ---------- DEBUG SWITCHES ----------
+    // Start with baseline=true to verify geometry/data. Flip to false once you can see points.
+    const DEBUG = { baseline:true, showAxes:true, greyBG:true };
+
     // ---------- globals ----------
     let scene,camera,renderer,controls,mainScene;
     let corePoints=null,coreMat=null,dynPoints=null,dynMat=null;
@@ -89,7 +89,7 @@
     let stridePos=0,strideCol=0;
     let dtPos=null,dtCol=null,tmpPosF32=null;
 
-    const params={ size:1800, coreOpacity:0.9, dynOpacity:0.9 };
+    const params={ size:3000, coreOpacity:1.0, dynOpacity:1.0 };
 
     // ---------- utils ----------
     async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
@@ -121,7 +121,7 @@
       log(`camera fit r=${r.toFixed(2)}`);
     }
 
-    // ---------- shaders ----------
+    // ---------- shaders (used when DEBUG.baseline=false) ----------
     const dynVS=`attribute float a_id; uniform sampler2D u_positions; uniform vec3 u_off,u_scale; uniform float u_size,u_n; varying float v_id;
       void main(){ float u=(a_id+0.5)/u_n; vec3 pN=texture2D(u_positions,vec2(u,0.5)).rgb; vec3 p=u_off+u_scale*pN;
       vec4 v=viewMatrix*vec4(p,1.0); gl_Position=projectionMatrix*v; float s=length(vec3(modelMatrix[0])); gl_PointSize=u_size*s*(1.0/-v.z); v_id=a_id; }`;
@@ -149,10 +149,19 @@
         g.setAttribute('color',new THREE.BufferAttribute(ones,3));
       }
 
-      coreMat=new THREE.ShaderMaterial({
-        uniforms:{ u_size:{value:params.size}, u_opacity:{value:params.coreOpacity} },
-        vertexShader: coreVS, fragmentShader: coreFS, transparent:true, depthWrite:false
-      });
+      if (DEBUG.baseline) {
+        coreMat = new THREE.PointsMaterial({
+          size: params.size, sizeAttenuation:true,
+          vertexColors: !!g.getAttribute('color'),
+          opacity: params.coreOpacity, transparent:true, depthWrite:false
+        });
+      } else {
+        coreMat = new THREE.ShaderMaterial({
+          uniforms:{ u_size:{value:params.size}, u_opacity:{value:params.coreOpacity} },
+          vertexShader: coreVS, fragmentShader: coreFS, transparent:true, depthWrite:false
+        });
+      }
+
       const pts=new THREE.Points(g,coreMat); pts.frustumCulled=false;
       return pts;
     }
@@ -171,21 +180,50 @@
       stridePos=numPoints*3*2; strideCol=numPoints*3;
       tmpPosF32=new Float32Array(numPoints*3);
 
-      const geom=idsGeom(numPoints);
-      dynMat=new THREE.ShaderMaterial({
-        uniforms:{
-          u_positions:{value:null}, u_colors:{value:null},
-          u_off:{value:qOff}, u_scale:{value:qScale},
-          u_size:{value:params.size}, u_n:{value:numPoints}, u_opacity:{value:params.dynOpacity}
-        },
-        vertexShader: dynVS, fragmentShader: dynFS, transparent:true, depthWrite:false
-      });
-      dynPoints=new THREE.Points(geom,dynMat); dynPoints.frustumCulled=false;
+      if (DEBUG.baseline) {
+        // Build a one-frame baseline geometry (so we can SEE something)
+        const geom = new THREE.BufferGeometry();
 
-      updateFrameTextures(0);
-      dynMat.uniforms.u_positions.value=dtPos;
-      dynMat.uniforms.u_colors.value   =dtCol;
-      return dynPoints;
+        // positions = first frame -> dequantize: p = off + scale * norm
+        const u16 = new Uint16Array(posBuf, 0, numPoints*3);
+        const pArr = new Float32Array(numPoints*3);
+        for (let i=0;i<u16.length;i++) {
+          const n = f16_to_f32(u16[i]);
+          const ax = i % 3;
+          pArr[i] = qOff.getComponent(ax) + qScale.getComponent(ax) * n;
+        }
+        geom.setAttribute('position', new THREE.BufferAttribute(pArr, 3));
+
+        // colors = first frame u8 -> float 0..1
+        const u8 = new Uint8Array(colBuf, 0, numPoints*3);
+        const cArr = new Float32Array(numPoints*3);
+        for (let i=0;i<u8.length;i++) cArr[i] = u8[i]/255;
+        geom.setAttribute('color', new THREE.BufferAttribute(cArr, 3));
+
+        dynMat = new THREE.PointsMaterial({
+          size: params.size, sizeAttenuation:true,
+          vertexColors:true, opacity: params.dynOpacity, transparent:true, depthWrite:false
+        });
+        dynPoints = new THREE.Points(geom, dynMat);
+        dynPoints.frustumCulled = false;
+        return dynPoints;
+      } else {
+        const geom=idsGeom(numPoints);
+        dynMat=new THREE.ShaderMaterial({
+          uniforms:{
+            u_positions:{value:null}, u_colors:{value:null},
+            u_off:{value:qOff}, u_scale:{value:qScale},
+            u_size:{value:params.size}, u_n:{value:numPoints}, u_opacity:{value:params.dynOpacity}
+          },
+          vertexShader: dynVS, fragmentShader: dynFS, transparent:true, depthWrite:false
+        });
+        dynPoints=new THREE.Points(geom,dynMat); dynPoints.frustumCulled=false;
+
+        updateFrameTextures(0);
+        dynMat.uniforms.u_positions.value=dtPos;
+        dynMat.uniforms.u_colors.value   =dtCol;
+        return dynPoints;
+      }
     }
 
     function updateFrameTextures(i){
@@ -214,7 +252,7 @@
       camera.position.set(0,0,3);
       renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
       renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth,innerHeight);
-      renderer.xr.enabled=true; renderer.setClearColor(0x000000,1);
+      renderer.xr.enabled=true; renderer.setClearColor(DEBUG.greyBG ? 0x111111 : 0x000000,1);
       container.appendChild(renderer.domElement);
       controls=new OrbitControls(camera,renderer.domElement);
       controls.enableDamping=true; controls.dampingFactor=0.05;
@@ -223,6 +261,7 @@
       const g2=renderer.xr.getControllerGrip(1); g2.add(xmf.createControllerModel(g2)); scene.add(g2);
       const h1=renderer.xr.getHand(0); h1.add(new OculusHandModel(h1)); scene.add(h1);
       const h2=renderer.xr.getHand(1); h2.add(new OculusHandModel(h2)); scene.add(h2);
+      if (DEBUG.showAxes) scene.add(new THREE.AxesHelper(1));
       mainScene=new THREE.Object3D(); scene.add(mainScene);
       addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
     }
@@ -233,15 +272,23 @@
 
       const sizeCtrl = gui.add(params, "size", 50, 4000).name("Point Size");
       sizeCtrl.onChange(v => {
-        if (coreMat) coreMat.uniforms.u_size.value = v;
-        if (dynMat)  dynMat.uniforms.u_size.value  = v;
+        if (coreMat?.isShaderMaterial) coreMat.uniforms.u_size.value = v;
+        if (dynMat?.isShaderMaterial)  dynMat .uniforms.u_size.value = v;
+        if (coreMat?.isPointsMaterial) coreMat.size = v;
+        if (dynMat ?.isPointsMaterial) dynMat .size = v;
       });
 
       const coreCtrl = gui.add(params, "coreOpacity", 0.0, 1.0).name("coreOpacity");
-      coreCtrl.onChange(v => { if (coreMat) coreMat.uniforms.u_opacity.value = v; });
+      coreCtrl.onChange(v => {
+        if (coreMat?.isShaderMaterial) coreMat.uniforms.u_opacity.value = v;
+        if (coreMat?.isPointsMaterial) coreMat.opacity = v;
+      });
 
       const dynCtrl  = gui.add(params, "dynOpacity", 0.0, 1.0).name("dynOpacity");
-      dynCtrl.onChange(v => { if (dynMat) dynMat.uniforms.u_opacity.value = v; });
+      dynCtrl.onChange(v => {
+        if (dynMat?.isShaderMaterial) dynMat.uniforms.u_opacity.value = v;
+        if (dynMat?.isPointsMaterial) dynMat.opacity = v;
+      });
 
       const visFolder = gui.addFolder("Visibility");
       const vis = { core:true, dynamic:true };
@@ -254,9 +301,9 @@
       const pbFolder = gui.addFolder("Playback");
       pbFolder.add(pb, "play").name("Play/Pause");
       pbFolder.add(pb, "fps", 1, 60, 1).name("FPS").onChange(v => { fps = v|0; });
-      const frameCtrl = pbFolder.add(pb, "frame", 0, Math.max(0, numFrames-1), 1).name("Frame");
+      const frameCtrl = pbFolder.add(pb, "frame", 0, ()=>Math.max(0, numFrames-1), 1).name("Frame");
       frameCtrl.onChange(i => {
-        if (!pb.play && header) {
+        if (!pb.play && header && !DEBUG.baseline) {
           updateFrameTextures(i|0);
           if (dynMat) {
             dynMat.uniforms.u_positions.value = dtPos;
@@ -283,7 +330,7 @@
     function animate(){
       const t=clock.getElapsedTime(); const dt=t-last; last=t;
       controls.update();
-      if(header){
+      if(header && !DEBUG.baseline){
         updateFrameTextures(frameIdx());
         if(dynMat){ dynMat.uniforms.u_positions.value=dtPos; dynMat.uniforms.u_colors.value=dtCol; }
       }

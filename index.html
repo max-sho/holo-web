@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Hologram — Core + Dynamic (Debug)</title>
+  <title>Hologram — Core + Dynamic (Debug + GUI)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <style>
     html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Monospace}
@@ -11,9 +11,10 @@
     #err{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);max-width:90%;color:#f66;font:13px monospace;white-space:pre-wrap}
     #log{position:fixed;left:10px;bottom:10px;z-index:20;font:12px monospace;color:#ddd;white-space:pre;pointer-events:none}
     .ok{color:#9f9}.bad{color:#f99}
+    .hidden{display:none}
   </style>
 
-  <!-- Import map to resolve bare specifiers used by three/examples -->
+  <!-- Import map so addons can `import 'three'` -->
   <script type="importmap">
   {
     "imports": {
@@ -23,23 +24,25 @@
   }
   </script>
 
-  <!-- defaults + query overrides -->
+  <!-- Defaults (override via ?asset=&track=) -->
   <script>
     window.ASSET_BASE_URL = "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
     window.TRACK_ID       = "demo_v1";
-    try{
-      const q=new URLSearchParams(location.search);
-      if(q.get('asset')) window.ASSET_BASE_URL=q.get('asset');
-      if(q.get('track')) window.TRACK_ID=q.get('track');
-    }catch{}
-    // error overlay
+    try {
+      const q = new URLSearchParams(location.search);
+      if (q.get('asset')) window.ASSET_BASE_URL = q.get('asset');
+      if (q.get('track')) window.TRACK_ID = q.get('track');
+    } catch {}
+    // Error overlays
     addEventListener('error', e=>{
       const d=document.createElement('div'); d.id='err';
-      d.textContent='JS Error: ' + (e.error?.stack || e.message); document.body.appendChild(d);
+      d.textContent='JS Error: '+(e.error?.stack || e.message);
+      document.body.appendChild(d);
     });
     addEventListener('unhandledrejection', e=>{
       const d=document.createElement('div'); d.id='err';
-      d.textContent='Promise Error: ' + (e.reason?.stack || e.reason); document.body.appendChild(d);
+      d.textContent='Promise Error: '+(e.reason?.stack || e.reason);
+      document.body.appendChild(d);
     });
   </script>
 
@@ -53,26 +56,23 @@
   <div id="log"></div>
 
   <script type="module">
-    // --- status logger ---
+    // ---------- status log ----------
     const logEl=document.getElementById('log');
     const log=(m,ok=true)=>{ const s=document.createElement('div'); s.className=ok?'ok':'bad'; s.textContent=(ok?'✓ ':'✗ ')+m; logEl.appendChild(s); console[ok?'log':'warn'](m); };
 
-    // Guard: import map support (modern Chrome/Edge/Safari/Firefox all have it)
     if (!HTMLScriptElement.supports?.('importmap')) {
-      log('Browser lacks importmap support — try latest Chrome/Edge/Safari.', false);
+      log('Browser lacks importmap support — use recent Chrome/Edge/Safari.', false);
     }
 
     log('boot');
 
-    // --- modules resolved via importmap ---
+    // ---------- modules ----------
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
     import { XRButton } from "three/addons/webxr/XRButton.js";
     import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
     import { OculusHandModel } from "three/addons/webxr/OculusHandModel.js";
-    import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
     import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
-
     log('modules ok');
 
     // ---------- config ----------
@@ -89,17 +89,19 @@
     let stridePos=0,strideCol=0;
     let dtPos=null,dtCol=null,tmpPosF32=null;
 
-    const params={ size:1300, coreOpacity:0.7, dynOpacity:0.6 };
+    const params={ size:1800, coreOpacity:0.9, dynOpacity:0.9 };
 
     // ---------- utils ----------
     async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
     async function b(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.arrayBuffer(); }
+
     function f16_to_f32(h){ const s=(h&0x8000)>>15,e=(h&0x7C00)>>10,f=h&0x03FF;
       if(!e) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
       if(e===31) return f?NaN:((s?-1:1)*Infinity);
       return (s?-1:1)*Math.pow(2,e-15)*(1+f/1024);
     }
     function convertF16Block(u16,out){ for(let i=0;i<u16.length;i++) out[i]=f16_to_f32(u16[i]); return out; }
+
     function texRGBA32F_fromRGBArray(arr,count){
       const rgba=new Float32Array(count*4);
       for(let i=0,j=0;i<count*3;i+=3,j+=4){ rgba[j]=arr[i]; rgba[j+1]=arr[i+1]; rgba[j+2]=arr[i+2]; rgba[j+3]=1.0; }
@@ -107,13 +109,14 @@
       t.needsUpdate=true; t.magFilter=t.minFilter=THREE.NearestFilter; t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping; return t;
     }
     function idsGeom(n){ const g=new THREE.BufferGeometry(); const ids=new Float32Array(n); for(let i=0;i<n;i++) ids[i]=i; g.setAttribute('a_id',new THREE.BufferAttribute(ids,1)); return g; }
-    function fitCameraToObject(obj,pad=1.2){
+
+    function fitCameraToObject(obj,pad=1.3){
       obj.geometry.computeBoundingSphere?.();
       const bs=obj.geometry.boundingSphere;
       if(!bs){ log('no bounding sphere',false); return; }
       const r=bs.radius*pad;
-      camera.position.set(bs.center.x,bs.center.y,bs.center.z + r*2.5);
-      camera.near=r/100; camera.far=r*20; camera.updateProjectionMatrix();
+      camera.position.set(bs.center.x,bs.center.y,bs.center.z + r*2.8);
+      camera.near=Math.max(0.01,r/100); camera.far=r*25; camera.updateProjectionMatrix();
       controls.target.copy(bs.center);
       log(`camera fit r=${r.toFixed(2)}`);
     }
@@ -128,7 +131,7 @@
       void main(){ vec4 v=viewMatrix*vec4(position,1.0); gl_Position=projectionMatrix*v; float s=length(vec3(modelMatrix[0])); gl_PointSize=u_size*s*(1.0/-v.z); v_c=color; }`;
     const coreFS=`uniform float u_opacity; varying vec3 v_c; void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; gl_FragColor=vec4(v_c,u_opacity);} `;
 
-    // ---------- load core ----------
+    // ---------- loaders ----------
     async function loadCore(m){
       const url=`${ASSET_BASE_URL}/${TRACK_ID}/${m.staticCore.url}`;
       const ab=await b(url);
@@ -136,25 +139,30 @@
       const text=new TextDecoder().decode(inflated);  // ASCII PLY
       const g=new PLYLoader().parse(text);
 
-      // colors -> Float32 [0..1]
       const ca=g.getAttribute('color');
       if(ca && ca.array instanceof Uint8Array){
-        const n=ca.count; const f=new Float32Array(n*3); for(let i=0;i<n*3;i++) f[i]=ca.array[i]/255; g.setAttribute('color',new THREE.BufferAttribute(f,3));
+        const n=ca.count; const f=new Float32Array(n*3);
+        for(let i=0;i<n*3;i++) f[i]=ca.array[i]/255;
+        g.setAttribute('color',new THREE.BufferAttribute(f,3));
       } else if(!ca){
-        const n=g.getAttribute('position').count; const ones=new Float32Array(n*3); ones.fill(1); g.setAttribute('color',new THREE.BufferAttribute(ones,3));
+        const n=g.getAttribute('position').count; const ones=new Float32Array(n*3); ones.fill(1);
+        g.setAttribute('color',new THREE.BufferAttribute(ones,3));
       }
 
-      coreMat=new THREE.ShaderMaterial({ uniforms:{u_size:{value:params.size},u_opacity:{value:params.coreOpacity}}, vertexShader:coreVS, fragmentShader:coreFS, transparent:true, depthWrite:false });
+      coreMat=new THREE.ShaderMaterial({
+        uniforms:{ u_size:{value:params.size}, u_opacity:{value:params.coreOpacity} },
+        vertexShader: coreVS, fragmentShader: coreFS, transparent:true, depthWrite:false
+      });
       const pts=new THREE.Points(g,coreMat); pts.frustumCulled=false;
       return pts;
     }
 
-    // ---------- load dynamic chunk ----------
     async function loadChunk(path){
       header = await j(`${ASSET_BASE_URL}/${TRACK_ID}/${path}header.json`);
       const {numFrames:fN=0,fps:fpsIn=8,numPoints:nPts=0,quant}=header;
       numFrames=fN; fps=fpsIn; numPoints=nPts;
       qOff.set(...quant.offset); qScale.set(...quant.scale);
+
       const [pb,cb]=await Promise.all([
         b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}positions.bin`),
         b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}colors.bin`)
@@ -164,32 +172,41 @@
       tmpPosF32=new Float32Array(numPoints*3);
 
       const geom=idsGeom(numPoints);
-      dynMat=new THREE.ShaderMaterial({ uniforms:{
+      dynMat=new THREE.ShaderMaterial({
+        uniforms:{
           u_positions:{value:null}, u_colors:{value:null},
           u_off:{value:qOff}, u_scale:{value:qScale},
           u_size:{value:params.size}, u_n:{value:numPoints}, u_opacity:{value:params.dynOpacity}
-        }, vertexShader:dynVS, fragmentShader:dynFS, transparent:true, depthWrite:false });
+        },
+        vertexShader: dynVS, fragmentShader: dynFS, transparent:true, depthWrite:false
+      });
       dynPoints=new THREE.Points(geom,dynMat); dynPoints.frustumCulled=false;
 
       updateFrameTextures(0);
       dynMat.uniforms.u_positions.value=dtPos;
-      dynMat.uniforms.u_colors.value=dtCol;
+      dynMat.uniforms.u_colors.value   =dtCol;
       return dynPoints;
     }
 
     function updateFrameTextures(i){
       const u16=new Uint16Array(posBuf, i*stridePos, numPoints*3);
       const u8 =new Uint8Array (colBuf, i*strideCol, numPoints*3);
-      const out=tmpPosF32; for(let k=0;k<u16.length;k++) out[k]=f16_to_f32(u16[k]); // convert
-      if(!dtPos) dtPos=texRGBA32F_fromRGBArray(out,numPoints);
-      else { const rgba=dtPos.image.data; for(let p=0,q=0;p<numPoints*3;p+=3,q+=4){ rgba[q]=out[p]; rgba[q+1]=out[p+1]; rgba[q+2]=out[p+2]; rgba[q+3]=1.0; } dtPos.needsUpdate=true; }
-      if(!dtCol){ dtCol=new THREE.DataTexture(new Uint8Array(u8),numPoints,1,THREE.RGBFormat,THREE.UnsignedByteType);
+      convertF16Block(u16,tmpPosF32);
+      if(!dtPos) dtPos=texRGBA32F_fromRGBArray(tmpPosF32,numPoints);
+      else {
+        const rgba=dtPos.image.data;
+        for(let p=0,q=0;p<numPoints*3;p+=3,q+=4){ rgba[q]=tmpPosF32[p]; rgba[q+1]=tmpPosF32[p+1]; rgba[q+2]=tmpPosF32[p+2]; rgba[q+3]=1.0; }
+        dtPos.needsUpdate=true;
+      }
+      if(!dtCol){
+        dtCol=new THREE.DataTexture(new Uint8Array(u8),numPoints,1,THREE.RGBFormat,THREE.UnsignedByteType);
         dtCol.needsUpdate=true; dtCol.magFilter=dtCol.minFilter=THREE.NearestFilter; dtCol.wrapS=dtCol.wrapT=THREE.ClampToEdgeWrapping;
-      } else { dtCol.image.data.set(new Uint8Array(u8)); dtCol.needsUpdate=true; }
+      } else {
+        dtCol.image.data.set(new Uint8Array(u8)); dtCol.needsUpdate=true;
+      }
     }
 
     // ---------- scene ----------
-    let rendererReady=false;
     function setupScene(){
       const container=document.getElementById('container');
       scene=new THREE.Scene();
@@ -198,7 +215,6 @@
       renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
       renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth,innerHeight);
       renderer.xr.enabled=true; renderer.setClearColor(0x000000,1);
-      rendererReady=true;
       container.appendChild(renderer.domElement);
       controls=new OrbitControls(camera,renderer.domElement);
       controls.enableDamping=true; controls.dampingFactor=0.05;
@@ -209,6 +225,55 @@
       const h2=renderer.xr.getHand(1); h2.add(new OculusHandModel(h2)); scene.add(h2);
       mainScene=new THREE.Object3D(); scene.add(mainScene);
       addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+    }
+
+    // ---------- GUI ----------
+    function setupGUI() {
+      const gui = new dat.GUI();
+
+      const sizeCtrl = gui.add(params, "size", 50, 4000).name("Point Size");
+      sizeCtrl.onChange(v => {
+        if (coreMat) coreMat.uniforms.u_size.value = v;
+        if (dynMat)  dynMat.uniforms.u_size.value  = v;
+      });
+
+      const coreCtrl = gui.add(params, "coreOpacity", 0.0, 1.0).name("coreOpacity");
+      coreCtrl.onChange(v => { if (coreMat) coreMat.uniforms.u_opacity.value = v; });
+
+      const dynCtrl  = gui.add(params, "dynOpacity", 0.0, 1.0).name("dynOpacity");
+      dynCtrl.onChange(v => { if (dynMat) dynMat.uniforms.u_opacity.value = v; });
+
+      const visFolder = gui.addFolder("Visibility");
+      const vis = { core:true, dynamic:true };
+      visFolder.add(vis, "core").onChange(v => { if (corePoints) corePoints.visible = v; });
+      visFolder.add(vis, "dynamic").onChange(v => { if (dynPoints)  dynPoints.visible  = v; });
+      visFolder.open();
+
+      // Playback (simple)
+      const pb = { play:true, frame:0, fps };
+      const pbFolder = gui.addFolder("Playback");
+      pbFolder.add(pb, "play").name("Play/Pause");
+      pbFolder.add(pb, "fps", 1, 60, 1).name("FPS").onChange(v => { fps = v|0; });
+      const frameCtrl = pbFolder.add(pb, "frame", 0, Math.max(0, numFrames-1), 1).name("Frame");
+      frameCtrl.onChange(i => {
+        if (!pb.play && header) {
+          updateFrameTextures(i|0);
+          if (dynMat) {
+            dynMat.uniforms.u_positions.value = dtPos;
+            dynMat.uniforms.u_colors.value    = dtCol;
+          }
+        }
+      });
+      pbFolder.open();
+
+      // Tie “play” into our frame selector
+      const _frameIdx = frameIdx;
+      window.frameIdx = function () {
+        return pb.play ? _frameIdx() : (pb.frame|0);
+      };
+
+      // quick toggle
+      window.addEventListener("keydown", e => { if (e.key.toLowerCase() === "g") gui.domElement.classList.toggle("hidden"); });
     }
 
     // ---------- loop ----------
@@ -228,6 +293,7 @@
     // ---------- boot ----------
     (async function main(){
       setupScene();
+
       log('fetch manifest...');
       const manifest=await j(manifestUrl);      log('manifest ok');
 
@@ -243,7 +309,8 @@
       mainScene.add(dynPoints);
       log(`chunk ok (${numPoints} dyn pts/frame @ ${fps} fps)`);
 
-      if(!rendererReady){ log('renderer not ready', false); return; }
+      setupGUI();
+
       log('start loop');
       renderer.setAnimationLoop(animate);
     })().catch(err=>{

@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>Hologram — Points + GPGPU Curl (WebXR)</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1, user-scalable=no"/>
+    <style>
+      body{margin:0;background:#000;color:#fff;font-family:Monospace;font-size:13px;overflow:hidden}
+      #info{position:absolute;top:10px;left:0;right:0;text-align:center;z-index:100;text-shadow:0 0 5px #000;pointer-events:none}
+      #container{width:100vw;height:100vh}
+      .webxr-button{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);padding:10px 20px;background:#0080ff;color:#fff;border:0;border-radius:5px;cursor:pointer;z-index:1000}
+    </style>
+  </head>
+  <body>
+    <div id="info">Hologram — Preprocessed Points (Core + Dynamic) • GPGPU Curl • WebXR</div>
+    <div id="container"></div>
+
+    <!-- Three.js + addons -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
+    <!-- For .ply.gz support (only needed if your core is PLY) -->
+    <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { XRButton } from "three/addons/webxr/XRButton.js";
+      import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
+      import { OculusHandModel } from "three/addons/webxr/OculusHandModel.js";
+      import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
+      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+      import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+
+      // ---------- CONFIG ----------
+      // Prefer setting these via Vercel env -> injected as global window vars.
+      const ASSET_BASE_URL = (window.ASSET_BASE_URL || "").trim() || "https://YOUR-CDN-DOMAIN/assets";
+      const TRACK_ID       = (window.TRACK_ID || "").trim()       || "demo_v1";   // e.g. demo_v1 from Stage 1
+      const manifestUrl    = `${ASSET_BASE_URL}/${TRACK_ID}/manifest.json`;
+
+      // ---------- Globals ----------
+      let scene, camera, renderer, controls, mainScene;
+      let corePoints=null, coreMaterial=null, dynamicPoints=null, dynamicMaterial=null;
+      let gpuCompute=null, positionVariable=null, gpgpuParticles=null, gpgpuMaterial=null;
+
+      // Dynamic frame data
+      let dynHeader=null, dynPositionsBuffer=null, dynColorsBuffer=null;
+      let numFrames=0, fps=8, numPoints=0;
+      let quantOffset=new THREE.Vector3(), quantScale=new THREE.Vector3();
+      let frameStridePos=0, frameStrideCol=0;
+      let dtPositions=null, dtColors=null;            // per-frame DataTextures
+      let positionsArrayF32=null, colorsArrayU8=null; // staging arrays
+
+      // Audio
+      let audioCtx=null, audioBuf=null, src=null, isPlaying=false, muted=true, audioStart=0, audioPausedAt=0, audioDur=0;
+
+      // GUI params
+      const params = {
+        particleSize: 2.0,
+        coreOpacity: 1.0,
+        dynamicOpacity: 0.35,
+        highResolution: false, // future: swap higher-density assets
+        // FX
+        showGpgpuParticles: true,
+        gpgpuLifeDuration: 5.0,
+        gpgpuSpeed: 40.0,
+        gpgpuOpacity: 0.25,
+        curlAmplitude: 40.0,
+        curlFrequency: 0.005,
+        interactionForce: -220.0,
+        interactionRadius: 0.5,
+        additiveBlending: true,
+        // Playback
+        playPause: () => {},
+        toggleMute: () => {},
+      };
+
+      // ---------- Utils ----------
+      async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
+      async function b(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.arrayBuffer(); }
+
+      // Float16 -> Float32 (IEEE-754)
+      function f16_to_f32(h){
+        const s=(h&0x8000)>>15, e=(h&0x7C00)>>10, f=h&0x03FF;
+        if(!e) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
+        if(e===31) return f?NaN:((s?-1:1)*Infinity);
+        return (s?-1:1)*Math.pow(2,e-15)*(1+f/1024);
+      }
+      function convertF16Block(u16, f32out){
+        for(let i=0;i<u16.length;i++) f32out[i]=f16_to_f32(u16[i]);
+        return f32out;
+      }
+
+      function makeRGB32FTexture(floatArray, count){
+        const tex = new THREE.DataTexture(new Float32Array(floatArray.buffer), count, 1, THREE.RGBFormat, THREE.FloatType);
+        tex.needsUpdate=true; tex.magFilter=THREE.NearestFilter; tex.minFilter=THREE.NearestFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
+      }
+      function makeRGB8Texture(u8Array, count){
+        const tex = new THREE.DataTexture(new Uint8Array(u8Array.buffer), count, 1, THREE.RGBFormat, THREE.UnsignedByteType);
+        tex.needsUpdate=true; tex.magFilter=THREE.NearestFilter; tex.minFilter=THREE.NearestFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
+      }
+
+      function createPointsGeometry(count){
+        const g=new THREE.BufferGeometry(); const ids=new Float32Array(count); for(let i=0;i<count;i++) ids[i]=i;
+        g.setAttribute("a_id", new THREE.BufferAttribute(ids,1)); return g;
+      }
+
+      // ---------- Shaders ----------
+      const dynamicVS = `
+        attribute float a_id;
+        uniform sampler2D u_positions;  // RGB32F normalized [0..1] per point
+        uniform vec3 u_offset, u_scale; // world = offset + scale * norm
+        uniform float u_size, u_pointCount;
+        varying float v_id;
+        void main(){
+          float u = (a_id + 0.5) / u_pointCount;
+          vec3 pN = texture2D(u_positions, vec2(u,0.5)).rgb;
+          vec3 pW = u_offset + u_scale * pN;
+          vec4 viewPos = viewMatrix * vec4(pW,1.0);
+          gl_Position = projectionMatrix * viewPos;
+          float objectScale = length(vec3(modelMatrix[0]));
+          gl_PointSize = u_size * objectScale * (1.0 / -viewPos.z);
+          v_id = a_id;
+        }`;
+      const dynamicFS = `
+        uniform sampler2D u_colors; // RGB8
+        uniform float u_pointCount, u_opacity;
+        varying float v_id;
+        void main(){
+          if(length(gl_PointCoord-vec2(0.5))>0.5) discard;
+          float u = (v_id + 0.5) / u_pointCount;
+          vec3 c = texture2D(u_colors, vec2(u,0.5)).rgb;
+          gl_FragColor = vec4(c, u_opacity);
+        }`;
+
+      const coreVS = `
+        attribute vec3 position; attribute vec3 color;
+        uniform float u_size; varying vec3 v_color;
+        void main(){
+          vec4 viewPos = viewMatrix * vec4(position,1.0);
+          gl_Position = projectionMatrix * viewPos;
+          float objectScale = length(vec3(modelMatrix[0]));
+          gl_PointSize = u_size * objectScale * (1.0 / -viewPos.z);
+          v_color = color;
+        }`;
+      const coreFS = `
+        uniform float u_opacity; varying vec3 v_color;
+        void main(){
+          if(length(gl_PointCoord-vec2(0.5))>0.5) discard;
+          gl_FragColor = vec4(v_color, u_opacity);
+        }`;
+
+      // ---------- Loaders ----------
+      async function loadCore(manifest){
+        const url = `${ASSET_BASE_URL}/${TRACK_ID}/${manifest.staticCore.url}`.toLowerCase();
+        if(url.endsWith(".glb")){
+          const gltf = await new GLTFLoader().loadAsync(url);
+          let pts=null;
+          gltf.scene.traverse(o=>{
+            if(o.isMesh || o.isPoints){
+              const g=o.geometry.clone();
+              if(!g.getAttribute("color")){
+                const n=g.getAttribute("position").count; const cols=new Float32Array(n*3); cols.fill(1.0);
+                g.setAttribute("color", new THREE.BufferAttribute(cols,3));
+              }
+              const mat=new THREE.ShaderMaterial({
+                uniforms:{ u_size:{value:params.particleSize}, u_opacity:{value:params.coreOpacity} },
+                vertexShader: coreVS, fragmentShader: coreFS, transparent:true, depthWrite:false
+              });
+              pts=new THREE.Points(g,mat); pts.frustumCulled=false; coreMaterial=mat;
+            }
+          });
+          return pts;
+        } else if(url.endsWith(".ply.gz")){
+          const ab=await b(url); const decompressed=window.pako.inflate(new Uint8Array(ab));
+          const g=new PLYLoader().parse(decompressed.buffer);
+          if(g.getAttribute("color")){
+            const c=g.getAttribute("color"); const arr=c.array; for(let i=0;i<arr.length;i++) arr[i]/=255.0;
+          } else {
+            const n=g.getAttribute("position").count; const cols=new Float32Array(n*3); cols.fill(1.0);
+            g.setAttribute("color", new THREE.BufferAttribute(cols,3));
+          }
+          const mat=new THREE.ShaderMaterial({
+            uniforms:{ u_size:{value:params.particleSize}, u_opacity:{value:params.coreOpacity} },
+            vertexShader: coreVS, fragmentShader: coreFS, transparent:true, depthWrite:false
+          });
+          const pts=new THREE.Points(g,mat); pts.frustumCulled=false; coreMaterial=mat; return pts;
+        }
+        throw new Error("Unsupported core format");
+      }
+
+      async function loadChunk(path){
+        const header = await j(`${ASSET_BASE_URL}/${TRACK_ID}/${path}header.json`);
+        dynHeader=header; fps=header.fps; numFrames=header.numFrames; numPoints=header.numPoints;
+        quantOffset.set(...header.quant.offset); quantScale.set(...header.quant.scale);
+        frameStridePos = numPoints*3*2; // f16
+        frameStrideCol = numPoints*3;   // u8
+
+        const [posBuf,colBuf] = await Promise.all([
+          b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}positions.bin`),
+          b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}colors.bin`)
+        ]);
+        dynPositionsBuffer=posBuf; dynColorsBuffer=colBuf;
+        positionsArrayF32 = new Float32Array(numPoints*3);
+        colorsArrayU8     = new Uint8Array(numPoints*3);
+
+        // Build dynamic geometry + material
+        const geom=createPointsGeometry(numPoints);
+        const mat=new THREE.ShaderMaterial({
+          uniforms:{
+            u_positions:{value:null}, u_colors:{value:null},
+            u_offset:{value:quantOffset}, u_scale:{value:quantScale},
+            u_size:{value:params.particleSize}, u_pointCount:{value:numPoints},
+            u_opacity:{value:params.dynamicOpacity}
+          },
+          vertexShader: dynamicVS, fragmentShader: dynamicFS,
+          transparent:true, depthWrite:false
+        });
+        dynamicMaterial=mat;
+        dynamicPoints=new THREE.Points(geom,mat); dynamicPoints.frustumCulled=false;
+
+        // Initialize first frame textures
+        updateFrameTextures(0);
+        mat.uniforms.u_positions.value = dtPositions;
+        mat.uniforms.u_colors.value    = dtColors;
+
+        // Init GPGPU FX (respawn from current dynamic positions)
+        initGPGPU();
+
+        return dynamicPoints;
+      }
+
+      function updateFrameTextures(frameIdx){
+        const posU16 = new Uint16Array(dynPositionsBuffer, frameIdx*frameStridePos, numPoints*3);
+        const colU8  = new Uint8Array (dynColorsBuffer,    frameIdx*frameStrideCol, numPoints*3);
+        convertF16Block(posU16, positionsArrayF32);
+        if(!dtPositions) dtPositions = makeRGB32FTexture(positionsArrayF32, numPoints);
+        else { dtPositions.image.data.set(new Float32Array(positionsArrayF32.buffer)); dtPositions.needsUpdate=true; }
+        if(!dtColors) dtColors = makeRGB8Texture(colU8, numPoints);
+        else { dtColors.image.data.set(new Uint8Array(colU8)); dtColors.needsUpdate=true; }
+      }
+
+      // ---------- Scene / GUI / Audio ----------
+      function initScene(){
+        const container=document.getElementById("container");
+        scene=new THREE.Scene();
+        camera=new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 10000);
+        camera.position.z=210;
+        renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+        renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(devicePixelRatio); renderer.xr.enabled=true;
+        renderer.setClearColor(0x000000,1); container.appendChild(renderer.domElement);
+
+        document.body.appendChild(XRButton.createButton(renderer,{requiredFeatures:["hand-tracking"]}));
+        controls=new OrbitControls(camera,renderer.domElement); controls.enableDamping=true; controls.dampingFactor=0.05;
+
+        renderer.domElement.addEventListener("webglcontextlost", e=>{e.preventDefault(); console.warn("WebGL lost");});
+        renderer.domElement.addEventListener("webglcontextrestored", ()=>{ console.log("WebGL restored"); if(dtPositions)dtPositions.needsUpdate=true; if(dtColors)dtColors.needsUpdate=true; });
+
+        mainScene=new THREE.Object3D(); scene.add(mainScene);
+        addHands();
+        addResize();
+      }
+      function addHands(){
+        const f=new XRControllerModelFactory();
+        const g1=renderer.xr.getControllerGrip(0); g1.add(f.createControllerModel(g1)); scene.add(g1);
+        const g2=renderer.xr.getControllerGrip(1); g2.add(f.createControllerModel(g2)); scene.add(g2);
+        const h1=renderer.xr.getHand(0); h1.add(new OculusHandModel(h1)); scene.add(h1);
+        const h2=renderer.xr.getHand(1); h2.add(new OculusHandModel(h2)); scene.add(h2);
+      }
+      function addResize(){ addEventListener("resize",()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); }); }
+
+      function buildGUI(){
+        const gui=new dat.GUI();
+        gui.add(params,"particleSize",1,4000).onChange(v=>{
+          if(coreMaterial) coreMaterial.uniforms.u_size.value=v;
+          if(dynamicMaterial) dynamicMaterial.uniforms.u_size.value=v;
+          if(gpgpuMaterial) gpgpuMaterial.uniforms.u_size.value=v;
+        });
+        gui.add(params,"coreOpacity",0,1).onChange(v=>{ if(coreMaterial) coreMaterial.uniforms.u_opacity.value=v; });
+        gui.add(params,"dynamicOpacity",0,1).onChange(v=>{ if(dynamicMaterial) dynamicMaterial.uniforms.u_opacity.value=v; });
+        gui.add(params,"highResolution").name("High Density (future)");
+
+        const fx=gui.addFolder("FX Particles");
+        fx.add(params,"showGpgpuParticles").name("Show FX").onChange(v=>{ if(gpgpuParticles) gpgpuParticles.visible=v; });
+        fx.add(params,"gpgpuLifeDuration",1,10).onChange(v=>{ if(positionVariable) positionVariable.material.uniforms.u_lifeDuration.value=v; });
+        fx.add(params,"gpgpuSpeed",-300,300).onChange(v=>{ if(positionVariable) positionVariable.material.uniforms.u_zSpeed.value=v; });
+        fx.add(params,"gpgpuOpacity",0.01,0.8).onChange(v=>{ if(gpgpuMaterial) gpgpuMaterial.uniforms.u_opacity.value=v; });
+        fx.add(params,"curlAmplitude",0,200).onChange(v=>{ if(positionVariable) positionVariable.material.uniforms.u_curlAmplitude.value=v; });
+        fx.add(params,"curlFrequency",0.001,0.05).onChange(v=>{ if(positionVariable) positionVariable.material.uniforms.u_curlFrequency.value=v; });
+        fx.add(params,"interactionForce",-500,500).name("Hand Force").onChange(v=>{ if(positionVariable) positionVariable.material.uniforms.u_interaction_force.value=v; });
+        fx.add(params,"interactionRadius",0.05,1.0).name("Hand Radius").onChange(v=>{ if(positionVariable) positionVariable.material.uniforms.u_interaction_radius.value=v; });
+        fx.add(params,"additiveBlending").name("Additive").onChange(v=>{
+          if(gpgpuMaterial){ gpgpuMaterial.blending = v?THREE.AdditiveBlending:THREE.NormalBlending; gpgpuMaterial.needsUpdate=true; }
+        });
+        fx.open();
+
+        const pb=gui.addFolder("Playback");
+        params.playPause=()=>{ togglePlayPause(); }; pb.add(params,"playPause").name("Play / Pause");
+        params.toggleMute=()=>{ muted=!muted; if(isPlaying){ stopAudio(); playAudio(); } }; pb.add(params,"toggleMute").name("Mute / Unmute");
+        pb.open();
+      }
+
+      async function loadAudio(url){
+        if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+        const ab=await b(url);
+        if(!ab.byteLength){ audioBuf=null; audioDur=10; return; } // placeholder ok
+        audioBuf=await audioCtx.decodeAudioData(ab.slice(0)); audioDur=audioBuf.duration;
+      }
+      function playAudio(){
+        if(!audioCtx){return;}
+        if(audioBuf){
+          src=audioCtx.createBufferSource(); const gain=audioCtx.createGain(); gain.gain.value=muted?0:1;
+          src.buffer=audioBuf; src.connect(gain).connect(audioCtx.destination);
+          src.start(0, audioPausedAt); audioStart=audioCtx.currentTime-audioPausedAt; isPlaying=true;
+          src.onended=()=>{ isPlaying=false; audioPausedAt=0; };
+        }else{
+          audioStart=audioCtx.currentTime; isPlaying=true; // silent timeline
+        }
+      }
+      function stopAudio(){ if(src){ try{src.stop();}catch{} src.disconnect(); src=null; } isPlaying=false; }
+      function togglePlayPause(){ if(!isPlaying){ playAudio(); } else { audioPausedAt=currentTimeSec(); stopAudio(); } }
+      function currentTimeSec(){ return audioCtx ? (isPlaying ? audioCtx.currentTime-audioStart : audioPausedAt) : 0; }
+
+      // ---------- GPGPU (respawn from current dynamic positions) ----------
+      function initGPGPU(){
+        gpuCompute = new GPUComputationRenderer(numPoints, 1, renderer);
+        if(renderer.capabilities.isWebGL2===false) gpuCompute.setDataType(THREE.HalfFloatType);
+
+        const tex0 = gpuCompute.createTexture(); const p=tex0.image.data;
+        for(let i=0;i<p.length;i+=4){ p[i]=0; p[i+1]=0; p[i+2]=0; p[i+3]=-1; }
+
+        positionVariable = gpuCompute.addVariable("texturePosition", positionShader(), tex0);
+        gpuCompute.setVariableDependencies(positionVariable,[positionVariable]);
+
+        const u = positionVariable.material.uniforms;
+        u.u_time={value:0}; u.u_deltaTime={value:0};
+        u.u_lifeDuration={value:params.gpgpuLifeDuration};
+        u.u_zSpeed={value:params.gpgpuSpeed};
+        u.u_curlAmplitude={value:params.curlAmplitude};
+        u.u_curlFrequency={value:params.curlFrequency};
+        u.u_emitterMatrix={value:new THREE.Matrix4()};
+        u.u_emitterScale={value:1.0};
+        u.u_forward={value:new THREE.Vector3(0,0,1)};
+        u.u_interaction_point={value:new THREE.Vector3(1000,1000,1000)};
+        u.u_interaction_force={value:params.interactionForce};
+        u.u_interaction_radius={value:params.interactionRadius};
+        u.u_spawnPositions={value:dtPositions};
+        u.u_pointCount={value:numPoints};
+
+        const err=gpuCompute.init(); if(err) console.error(err);
+
+        gpgpuMaterial = new THREE.ShaderMaterial({
+          uniforms:{
+            u_positions:{value: gpuCompute.getCurrentRenderTarget(positionVariable).texture},
+            u_size:{value: params.particleSize},
+            u_opacity:{value: params.gpgpuOpacity},
+            u_pointCount:{value:numPoints}
+          },
+          vertexShader: dynamicVS.replace("u_offset + u_scale * pN","pN").replace("u_positions","u_positions"),
+          fragmentShader: `
+            uniform float u_opacity;
+            void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; gl_FragColor=vec4(1.0,1.0,1.0,u_opacity); }
+          `,
+          transparent:true, depthWrite:false, blending: params.additiveBlending?THREE.AdditiveBlending:THREE.NormalBlending
+        });
+        gpgpuParticles = new THREE.Points(dynamicPoints.geometry, gpgpuMaterial);
+        gpgpuParticles.visible=params.showGpgpuParticles;
+        gpgpuParticles.frustumCulled=false;
+        mainScene.add(gpgpuParticles);
+      }
+
+      function positionShader(){
+        return `
+          uniform float u_time, u_deltaTime, u_lifeDuration, u_zSpeed, u_curlAmplitude, u_curlFrequency;
+          uniform mat4  u_emitterMatrix; uniform float u_emitterScale; uniform vec3 u_forward;
+          uniform vec3  u_interaction_point; uniform float u_interaction_force, u_interaction_radius;
+          uniform sampler2D u_spawnPositions; uniform float u_pointCount;
+
+          vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+          vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+          vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+          vec4 taylorInvSqrt(vec4 r){return 1.7928429-0.85373472*r;}
+          float snoise(vec3 v){
+            const vec2 C=vec2(1.0/6.0,1.0/3.0); const vec4 D=vec4(0.0,0.5,1.0,2.0);
+            vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+            vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.0-g; vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+            vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+            i=mod289(i);
+            vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));
+            float n_=0.142857142857; vec3 ns=n_*D.wyz-D.xzx;
+            vec4 j=p-49.0*floor(p*ns.z*ns.z); vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.0*x_);
+            vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy; vec4 h=1.0-abs(x)-abs(y);
+            vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+            vec4 s0=floor(b0)*2.0+1.0; vec4 s1=floor(b1)*2.0+1.0;
+            vec4 sh=-step(h,vec4(0.0));
+            vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+            vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y); vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+            vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+            p0*=norm.x; p1*=norm.y; p2*=norm.z; p3*=norm.w;
+            vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0); m*=m;
+            return 42.0*dot(m*m, vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+          }
+          vec3 curlNoise(vec3 p){
+            const float e=0.1; float n1,n2,n3,n4;
+            n1=snoise(vec3(p.x,p.y+e,p.z)); n2=snoise(vec3(p.x,p.y-e,p.z));
+            n3=snoise(vec3(p.x,p.y,p.z+e)); n4=snoise(vec3(p.x,p.y,p.z-e));
+            float cx=(n1-n2)-(n3-n4);
+            n1=snoise(vec3(p.x,p.y,p.z+e)); n2=snoise(vec3(p.x,p.y,p.z-e));
+            n3=snoise(vec3(p.x+e,p.y,p.z)); n4=snoise(vec3(p.x-e,p.y,p.z));
+            float cy=(n1-n2)-(n3-n4);
+            n1=snoise(vec3(p.x+e,p.y,p.z)); n2=snoise(vec3(p.x-e,p.y,p.z));
+            n3=snoise(vec3(p.x,p.y+e,p.z)); n4=snoise(vec3(p.x,p.y-e,p.z));
+            float cz=(n1-n2)-(n3-n4);
+            return vec3(cx,cy,cz);
+          }
+          float rand(vec2 co){return fract(sin(dot(co,vec2(12.9898,78.233)))*43758.5453);}
+          void main(){
+            vec2 uv = gl_FragCoord.xy / resolution.xy;
+            vec4 pl = texture2D(texturePosition, uv);
+            vec3 pos = pl.xyz; float life = pl.w;
+            life -= u_deltaTime;
+            if(life < 0.0){
+              float id = rand(uv + u_time) * u_pointCount;
+              float uu = (id + 0.5) / u_pointCount;
+              pos = texture2D(u_spawnPositions, vec2(uu,0.5)).rgb; // world space (after de-quant)
+              life = u_lifeDuration + u_lifeDuration * (rand(uv+u_time*1.7)*2.0-1.0)*0.5;
+            } else {
+              pos += u_forward * u_zSpeed * u_emitterScale * u_deltaTime;
+              vec3 turb = curlNoise(pos/u_emitterScale * u_curlFrequency);
+              pos += turb * u_curlAmplitude * u_emitterScale * u_deltaTime;
+              vec3 toH = pos - u_interaction_point; float d=length(toH);
+              if(d<u_interaction_radius && d>0.0){
+                float fall = pow(1.0 - (d/u_interaction_radius), 2.0);
+                pos += normalize(toH) * u_interaction_force * fall * u_emitterScale * u_deltaTime;
+              }
+            }
+            gl_FragColor = vec4(pos, life);
+          }`;
+      }
+
+      // ---------- Timeline ----------
+      function activeFrameIdx(){ if(!dynHeader) return 0; const t=currentTimeSec(); return Math.floor(t*fps)%Math.max(1,numFrames); }
+
+      // ---------- Animate ----------
+      const clock=new THREE.Clock(); let last=0;
+      function animate(){
+        const t=clock.getElapsedTime(); const dt=t-last; last=t;
+        controls.update();
+
+        if(dynHeader){
+          const f=activeFrameIdx();
+          updateFrameTextures(f);
+          if(dynamicMaterial){ dynamicMaterial.uniforms.u_positions.value=dtPositions; dynamicMaterial.uniforms.u_colors.value=dtColors; }
+          if(positionVariable){
+            positionVariable.material.uniforms.u_spawnPositions.value=dtPositions;
+            positionVariable.material.uniforms.u_pointCount.value=numPoints;
+            positionVariable.material.uniforms.u_time.value=t;
+            positionVariable.material.uniforms.u_deltaTime.value=dt;
+            gpuCompute.compute();
+            gpgpuMaterial.uniforms.u_positions.value = gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+          }
+        }
+
+        renderer.render(scene,camera);
+      }
+
+      // ---------- Boot ----------
+      (async function main(){
+        initScene(); buildGUI();
+        const manifest = await j(manifestUrl);
+
+        // Core
+        corePoints = await loadCore(manifest);
+        if(corePoints){ coreMaterial.uniforms.u_size.value=params.particleSize; mainScene.add(corePoints); }
+
+        // Dynamic (first chunk only for MVP)
+        const path = manifest.dynamic.chunks[0].path; // e.g. dyn/chunk_000/
+        dynamicPoints = await loadChunk(path);
+        mainScene.add(dynamicPoints);
+
+        // Audio (load but start paused)
+        await loadAudio(`${ASSET_BASE_URL}/${TRACK_ID}/${manifest.audio.url}`);
+
+        renderer.setAnimationLoop(animate);
+      })().catch(console.error);
+    </script>
+  </body>
+</html>

@@ -13,6 +13,16 @@
     .ok{color:#9f9}.bad{color:#f99}
   </style>
 
+  <!-- Import map to resolve bare specifiers used by three/examples -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.167.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.167.0/examples/jsm/"
+    }
+  }
+  </script>
+
   <!-- defaults + query overrides -->
   <script>
     window.ASSET_BASE_URL = "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
@@ -22,7 +32,6 @@
       if(q.get('asset')) window.ASSET_BASE_URL=q.get('asset');
       if(q.get('track')) window.TRACK_ID=q.get('track');
     }catch{}
-
     // error overlay
     addEventListener('error', e=>{
       const d=document.createElement('div'); d.id='err';
@@ -48,16 +57,21 @@
     const logEl=document.getElementById('log');
     const log=(m,ok=true)=>{ const s=document.createElement('div'); s.className=ok?'ok':'bad'; s.textContent=(ok?'✓ ':'✗ ')+m; logEl.appendChild(s); console[ok?'log':'warn'](m); };
 
+    // Guard: import map support (modern Chrome/Edge/Safari/Firefox all have it)
+    if (!HTMLScriptElement.supports?.('importmap')) {
+      log('Browser lacks importmap support — try latest Chrome/Edge/Safari.', false);
+    }
+
     log('boot');
 
-    // --- modules from unpkg (real .js URLs) ---
-    import * as THREE from "https://unpkg.com/three@0.167.0/build/three.module.js";
-    import { OrbitControls } from "https://unpkg.com/three@0.167.0/examples/jsm/controls/OrbitControls.js";
-    import { XRButton } from "https://unpkg.com/three@0.167.0/examples/jsm/webxr/XRButton.js";
-    import { XRControllerModelFactory } from "https://unpkg.com/three@0.167.0/examples/jsm/webxr/XRControllerModelFactory.js";
-    import { OculusHandModel } from "https://unpkg.com/three@0.167.0/examples/jsm/webxr/OculusHandModel.js";
-    import { GPUComputationRenderer } from "https://unpkg.com/three@0.167.0/examples/jsm/misc/GPUComputationRenderer.js";
-    import { PLYLoader } from "https://unpkg.com/three@0.167.0/examples/jsm/loaders/PLYLoader.js";
+    // --- modules resolved via importmap ---
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { XRButton } from "three/addons/webxr/XRButton.js";
+    import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
+    import { OculusHandModel } from "three/addons/webxr/OculusHandModel.js";
+    import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
+    import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
     log('modules ok');
 
@@ -69,7 +83,6 @@
     // ---------- globals ----------
     let scene,camera,renderer,controls,mainScene;
     let corePoints=null,coreMat=null,dynPoints=null,dynMat=null;
-    let gpuCompute=null,positionVar=null,gpgpuPts=null,gpgpuMat=null;
     let header=null,posBuf=null,colBuf=null;
     let numFrames=0,fps=8,numPoints=0;
     let qOff=new THREE.Vector3(), qScale=new THREE.Vector3();
@@ -139,13 +152,15 @@
     // ---------- load dynamic chunk ----------
     async function loadChunk(path){
       header = await j(`${ASSET_BASE_URL}/${TRACK_ID}/${path}header.json`);
-      numFrames=header.numFrames|0; fps=header.fps|0; numPoints=header.numPoints|0;
-      qOff.set(...header.quant.offset); qScale.set(...header.quant.scale);
-      stridePos=numPoints*3*2; strideCol=numPoints*3;
-      [posBuf,colBuf]=await Promise.all([
+      const {numFrames:fN=0,fps:fpsIn=8,numPoints:nPts=0,quant}=header;
+      numFrames=fN; fps=fpsIn; numPoints=nPts;
+      qOff.set(...quant.offset); qScale.set(...quant.scale);
+      const [pb,cb]=await Promise.all([
         b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}positions.bin`),
         b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}colors.bin`)
       ]);
+      posBuf=pb; colBuf=cb;
+      stridePos=numPoints*3*2; strideCol=numPoints*3;
       tmpPosF32=new Float32Array(numPoints*3);
 
       const geom=idsGeom(numPoints);
@@ -165,15 +180,16 @@
     function updateFrameTextures(i){
       const u16=new Uint16Array(posBuf, i*stridePos, numPoints*3);
       const u8 =new Uint8Array (colBuf, i*strideCol, numPoints*3);
-      convertF16Block(u16,tmpPosF32);
-      if(!dtPos) dtPos=texRGBA32F_fromRGBArray(tmpPosF32,numPoints);
-      else { const rgba=dtPos.image.data; for(let p=0,q=0;p<numPoints*3;p+=3,q+=4){ rgba[q]=tmpPosF32[p]; rgba[q+1]=tmpPosF32[p+1]; rgba[q+2]=tmpPosF32[p+2]; rgba[q+3]=1.0; } dtPos.needsUpdate=true; }
+      const out=tmpPosF32; for(let k=0;k<u16.length;k++) out[k]=f16_to_f32(u16[k]); // convert
+      if(!dtPos) dtPos=texRGBA32F_fromRGBArray(out,numPoints);
+      else { const rgba=dtPos.image.data; for(let p=0,q=0;p<numPoints*3;p+=3,q+=4){ rgba[q]=out[p]; rgba[q+1]=out[p+1]; rgba[q+2]=out[p+2]; rgba[q+3]=1.0; } dtPos.needsUpdate=true; }
       if(!dtCol){ dtCol=new THREE.DataTexture(new Uint8Array(u8),numPoints,1,THREE.RGBFormat,THREE.UnsignedByteType);
         dtCol.needsUpdate=true; dtCol.magFilter=dtCol.minFilter=THREE.NearestFilter; dtCol.wrapS=dtCol.wrapT=THREE.ClampToEdgeWrapping;
       } else { dtCol.image.data.set(new Uint8Array(u8)); dtCol.needsUpdate=true; }
     }
 
     // ---------- scene ----------
+    let rendererReady=false;
     function setupScene(){
       const container=document.getElementById('container');
       scene=new THREE.Scene();
@@ -182,6 +198,7 @@
       renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
       renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth,innerHeight);
       renderer.xr.enabled=true; renderer.setClearColor(0x000000,1);
+      rendererReady=true;
       container.appendChild(renderer.domElement);
       controls=new OrbitControls(camera,renderer.domElement);
       controls.enableDamping=true; controls.dampingFactor=0.05;
@@ -196,7 +213,7 @@
 
     // ---------- loop ----------
     const clock=new THREE.Clock(); let last=0;
-    function getNow(){ return performance.now()*0.001; } // simple clock for debug
+    function getNow(){ return performance.now()*0.001; }
     function frameIdx(){ if(!header) return 0; const t=getNow(); return Math.floor(t*fps)%Math.max(1,numFrames); }
     function animate(){
       const t=clock.getElapsedTime(); const dt=t-last; last=t;
@@ -212,11 +229,13 @@
     (async function main(){
       setupScene();
       log('fetch manifest...');
-      const manifest=await j(`${manifestUrl}`);      log('manifest ok');
+      const manifest=await j(manifestUrl);      log('manifest ok');
 
       log('load core...');
-      corePoints=await loadCore(manifest);           log('core ok ('+(corePoints.geometry.getAttribute('position').count|0)+' pts)');
+      corePoints=await loadCore(manifest);
       mainScene.add(corePoints);
+      const nCore=corePoints.geometry.getAttribute('position').count|0;
+      log(`core ok (${nCore} pts)`);
       fitCameraToObject(corePoints,1.3);
 
       log('load first chunk...');
@@ -224,6 +243,7 @@
       mainScene.add(dynPoints);
       log(`chunk ok (${numPoints} dyn pts/frame @ ${fps} fps)`);
 
+      if(!rendererReady){ log('renderer not ready', false); return; }
       log('start loop');
       renderer.setAnimationLoop(animate);
     })().catch(err=>{

@@ -324,4 +324,34 @@
         fx.open(); pb.open();
       }
 
-      // ------- TIME
+      // ------- TIMELINE / LOOP -------
+      function frameIdx(){ if(!header) return 0; const t=getNow(); return Math.floor(t*fps)%Math.max(1,numFrames); }
+      const clock=new THREE.Clock(); let last=0;
+      function animate(){
+        const t=clock.getElapsedTime(); const dt=t-last; last=t;
+        controls.update();
+        if(header){
+          updateFrameTextures(frameIdx());
+          if(dynMat){ dynMat.uniforms.u_positions.value=dtPos; dynMat.uniforms.u_colors.value=dtCol; }
+          if(positionVar){ positionVar.material.uniforms.u_time.value=t; positionVar.material.uniforms.u_dt.value=dt; gpuCompute.compute();
+            gpgpuMat.uniforms.u_positions.value=gpuCompute.getCurrentRenderTarget(positionVar).texture; }
+        }
+        renderer.render(scene,camera);
+      }
+
+      // ------- BOOT -------
+      (async function main(){
+        setupScene(); setupGUI();
+        const manifest = await j(manifestUrl);
+        corePoints = await loadCore(manifest); mainScene.add(corePoints);
+        dynPoints  = await loadChunk(manifest.dynamic.chunks[0].path); mainScene.add(dynPoints);
+        await loadAudio(`${ASSET_BASE_URL}/${TRACK_ID}/${manifest.audio.url}`);
+        if (numPoints>0) initFX();
+        renderer.setAnimationLoop(animate);
+      })().catch(err=>{
+        const d=document.createElement('div'); d.id='err'; d.textContent='Init Error: '+(err.stack||err.message);
+        document.body.appendChild(d); console.error(err);
+      });
+    </script>
+  </body>
+</html>

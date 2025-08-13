@@ -77,7 +77,7 @@
     const manifestUrl=`${ASSET_BASE_URL}/${TRACK_ID}/manifest.json`;
 
     // ---------- DEBUG SWITCHES ----------
-    // Start with baseline=true to verify geometry/data. Flip to false once you can see points.
+    // Keep true while validating visuals; set to false later to use shader/texture path.
     const DEBUG = { baseline:true, showAxes:true, greyBG:true };
 
     // ---------- globals ----------
@@ -89,7 +89,8 @@
     let stridePos=0,strideCol=0;
     let dtPos=null,dtCol=null,tmpPosF32=null;
 
-    const params={ size:3000, coreOpacity:1.0, dynOpacity:1.0 };
+    // Smaller default size; GUI range 1–200
+    const params={ size:6, coreOpacity:1.0, dynOpacity:1.0 };
 
     // ---------- utils ----------
     async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
@@ -120,6 +121,20 @@
       controls.target.copy(bs.center);
       log(`camera fit r=${r.toFixed(2)}`);
     }
+
+    // Round sprite (CanvasTexture) used by PointsMaterial
+    function circleSprite(size=64){
+      const c=document.createElement('canvas'); c.width=c.height=size;
+      const g=c.getContext('2d');
+      g.clearRect(0,0,size,size);
+      g.beginPath(); g.arc(size/2,size/2,size*0.48,0,Math.PI*2); g.closePath();
+      g.fillStyle='white'; g.fill();
+      const tx = new THREE.CanvasTexture(c);
+      tx.magFilter = THREE.LinearFilter; tx.minFilter = THREE.LinearMipMapLinearFilter;
+      tx.wrapS = tx.wrapT = THREE.ClampToEdgeWrapping;
+      return tx;
+    }
+    const DISC_TEX = circleSprite();
 
     // ---------- shaders (used when DEBUG.baseline=false) ----------
     const dynVS=`attribute float a_id; uniform sampler2D u_positions; uniform vec3 u_off,u_scale; uniform float u_size,u_n; varying float v_id;
@@ -153,7 +168,8 @@
         coreMat = new THREE.PointsMaterial({
           size: params.size, sizeAttenuation:true,
           vertexColors: !!g.getAttribute('color'),
-          opacity: params.coreOpacity, transparent:true, depthWrite:false
+          opacity: params.coreOpacity, transparent:true, depthWrite:false,
+          map: DISC_TEX, alphaTest: 0.5
         });
       } else {
         coreMat = new THREE.ShaderMaterial({
@@ -202,7 +218,8 @@
 
         dynMat = new THREE.PointsMaterial({
           size: params.size, sizeAttenuation:true,
-          vertexColors:true, opacity: params.dynOpacity, transparent:true, depthWrite:false
+          vertexColors:true, opacity: params.dynOpacity, transparent:true, depthWrite:false,
+          map: DISC_TEX, alphaTest: 0.5
         });
         dynPoints = new THREE.Points(geom, dynMat);
         dynPoints.frustumCulled = false;
@@ -270,7 +287,8 @@
     function setupGUI() {
       const gui = new dat.GUI();
 
-      const sizeCtrl = gui.add(params, "size", 50, 4000).name("Point Size");
+      // size control (works for PointsMaterial or ShaderMaterial)
+      const sizeCtrl = gui.add(params, "size", 1, 200).name("Point Size");
       sizeCtrl.onChange(v => {
         if (coreMat?.isShaderMaterial) coreMat.uniforms.u_size.value = v;
         if (dynMat?.isShaderMaterial)  dynMat .uniforms.u_size.value = v;
@@ -295,6 +313,20 @@
       visFolder.add(vis, "core").onChange(v => { if (corePoints) corePoints.visible = v; });
       visFolder.add(vis, "dynamic").onChange(v => { if (dynPoints)  dynPoints.visible  = v; });
       visFolder.open();
+
+      // Color controls for baseline
+      const colorOpts = { useVertexColors: true, tint: [255,255,255] };
+      const colFolder = gui.addFolder("Color");
+      colFolder.add(colorOpts, "useVertexColors").name("Use Vertex Colors").onChange(v=>{
+        if (coreMat?.isPointsMaterial) { coreMat.vertexColors = v; coreMat.needsUpdate = true; }
+        if (dynMat ?.isPointsMaterial) { dynMat .vertexColors = v; dynMat .needsUpdate = true; }
+      });
+      colFolder.addColor(colorOpts, "tint").name("Tint").onChange(rgb=>{
+        const c = new THREE.Color(rgb[0]/255, rgb[1]/255, rgb[2]/255);
+        if (coreMat?.isPointsMaterial) coreMat.color.copy(c);
+        if (dynMat ?.isPointsMaterial) dynMat .color.copy(c);
+      });
+      colFolder.open();
 
       // Playback (simple)
       const pb = { play:true, frame:0, fps };

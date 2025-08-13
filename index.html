@@ -163,8 +163,12 @@
     const dynVS=`attribute float a_id; uniform sampler2D u_positions; uniform vec3 u_off,u_scale; uniform float u_size,u_n; varying float v_id;
       void main(){ float u=(a_id+0.5)/u_n; vec3 pN=texture2D(u_positions,vec2(u,0.5)).rgb; vec3 p=u_off+u_scale*pN;
       vec4 v=viewMatrix*vec4(p,1.0); gl_Position=projectionMatrix*v; float s=length(vec3(modelMatrix[0])); gl_PointSize=u_size*s*(1.0/-v.z); v_id=a_id; }`;
-    const dynFS=`uniform sampler2D u_colors; uniform float u_n,u_opacity; varying float v_id;
-      void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; float u=(v_id+0.5)/u_n; vec3 c=texture2D(u_colors,vec2(u,0.5)).rgb; gl_FragColor=vec4(c,u_opacity); }`;
+    const dynFS=`uniform sampler2D u_colors; uniform float u_n,u_opacity; uniform vec3 u_tint; uniform float u_useVertex; varying float v_id;
+      void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; 
+        float u=(v_id+0.5)/u_n; 
+        vec3 c = (u_useVertex>0.5) ? texture2D(u_colors,vec2(u,0.5)).rgb : vec3(1.0);
+        c *= u_tint;
+        gl_FragColor=vec4(c,u_opacity); }`;
     const coreVS=`attribute vec3 position; attribute vec3 color; uniform float u_size; varying vec3 v_c;
       void main(){ vec4 v=viewMatrix*vec4(position,1.0); gl_Position=projectionMatrix*v; float s=length(vec3(modelMatrix[0])); gl_PointSize=u_size*s*(1.0/-v.z); v_c=color; }`;
     const coreFS=`uniform float u_opacity; varying vec3 v_c; void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; gl_FragColor=vec4(v_c,u_opacity);} `;
@@ -245,16 +249,18 @@
       visFolder.add(vis, "dynamic").onChange(v => { if (dynPoints)  dynPoints.visible  = v; });
       visFolder.open();
 
-      const colorOpts = { useVertexColors: true, tint: [255,255,255] };
+      const colorOpts = { useVertexColors: false, tint: [255,255,255] };
       const colFolder = gui.addFolder("Color");
       colFolder.add(colorOpts, "useVertexColors").name("Use Vertex Colors").onChange(v=>{
         if (coreMat?.isPointsMaterial) { coreMat.vertexColors = v; coreMat.needsUpdate = true; }
         if (dynMat ?.isPointsMaterial) { dynMat .vertexColors = v; dynMat .needsUpdate = true; }
+        if (dynMat ?.isShaderMaterial)  { dynMat.uniforms.u_useVertex.value = v ? 1.0 : 0.0; }
       });
       colFolder.addColor(colorOpts, "tint").name("Tint").onChange(rgb=>{
         const c = new THREE.Color(rgb[0]/255, rgb[1]/255, rgb[2]/255);
         if (coreMat?.isPointsMaterial) coreMat.color.copy(c);
         if (dynMat ?.isPointsMaterial) dynMat .color.copy(c);
+        if (dynMat ?.isShaderMaterial)  dynMat.uniforms.u_tint.value.copy(c);
       });
       colFolder.open();
 
@@ -337,11 +343,15 @@
           uniforms:{
             u_positions:{value:null}, u_colors:{value:null},
             u_off:{value:qOff}, u_scale:{value:qScale},
-            u_size:{value:params.size}, u_n:{value:numPoints}, u_opacity:{value:params.dynOpacity}
+            u_size:{value:params.size}, u_n:{value:numPoints}, u_opacity:{value:params.dynOpacity},
+            u_tint:{value:new THREE.Color(1,1,1)}, u_useVertex:{value:1.0}
           },
           vertexShader: dynVS, fragmentShader: dynFS, transparent:true, depthWrite:false
         });
         dynPoints=new THREE.Points(geom,dynMat); dynPoints.frustumCulled=false;
+        // sync color uniforms with GUI defaults
+        dynMat.uniforms.u_useVertex.value = 0.0;
+        dynMat.uniforms.u_tint.value.set(1,1,1);
         updateFrameTextures(0);
         dynMat.uniforms.u_positions.value=dtPos;
         dynMat.uniforms.u_colors.value   =dtCol;
@@ -407,6 +417,19 @@
     }
 
     function rebuildDynamicGeometry(){
+      if (USE_GPU && dynPoints) {
+        const n = Math.max(1, Math.floor(numPoints * quality.density));
+        // Build strided ids into a smaller buffer, then swap attributes & uniforms
+        const ids = new Float32Array(n);
+        const pos = new Float32Array(n*3); // dummy
+        const step = Math.max(1, Math.floor(numPoints / n));
+        for (let k=0,i=0; k<n; k++, i+=step) ids[k] = i % numPoints;
+        dynPoints.geometry.setAttribute('a_id', new THREE.BufferAttribute(ids,1));
+        dynPoints.geometry.setAttribute('position', new THREE.BufferAttribute(pos,3));
+        if (dynMat?.isShaderMaterial) dynMat.uniforms.u_n.value = n;
+        return; // GPU path handled; CPU path below is skipped
+      }
+
       if (!header || USE_GPU || !dynPoints) return;
       // Rebuild CPU arrays according to new density
       buildSelectedIdx();

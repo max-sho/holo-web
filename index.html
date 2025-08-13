@@ -1,131 +1,608 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hologram — Preprocessed Points • GPU/CPU Path</title>
-    <style>
-        body { margin: 0; background-color: #111; color: white; font-family: monospace; }
-        #overlay {
-            position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px 10px; border-radius: 4px;
-            font-size: 12px; pointer-events: none;
-        }
-        canvas { display: block; }
-    </style>
+  <meta charset="utf-8" />
+  <title>Hologram — Core + Dynamic (Auto CPU/GPU) • Debug</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <style>
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Monospace}
+    #info{position:absolute;top:10px;left:0;right:0;text-align:center;z-index:20;pointer-events:none}
+    #container{width:100vw;height:100vh}
+    #err{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);max-width:90%;color:#f66;font:13px monospace;white-space:pre-wrap;z-index:30}
+    #log{position:fixed;left:10px;bottom:10px;z-index:20;font:12px monospace;color:#ddd;white-space:pre;pointer-events:none;max-width:60vw}
+    .ok{color:#9f9}.bad{color:#f99}.hidden{display:none}
+    #progress{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.6);padding:12px 16px;border:1px solid #444;border-radius:6px;z-index:25;font:13px monospace}
+  </style>
+
+  <!-- Import map so addons can `import 'three'` -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.167.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.167.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <!-- Defaults (override with ?asset=&track=) -->
+  <script>
+    window.ASSET_BASE_URL = "https://pub-e80d414bc7df438287d3018cdba68570.r2.dev";
+    window.TRACK_ID       = "demo_v1";
+    try {
+      const q = new URLSearchParams(location.search);
+      if (q.get('asset')) window.ASSET_BASE_URL = q.get('asset');
+      if (q.get('track')) window.TRACK_ID = q.get('track');
+    } catch {}
+
+    // Error overlays
+    addEventListener('error', e=>{
+      const d=document.getElementById('err')||document.body.appendChild(Object.assign(document.createElement('div'),{id:'err'}));
+      d.textContent='JS Error: '+(e.error?.stack || e.message);
+    });
+    addEventListener('unhandledrejection', e=>{
+      const d=document.getElementById('err')||document.body.appendChild(Object.assign(document.createElement('div'),{id:'err'}));
+      d.textContent='Promise Error: '+(e.reason?.stack || e.reason);
+    });
+  </script>
+
+  <!-- libs -->
+  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
 </head>
 <body>
-    <div id="overlay">boot</div>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.167.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.167.0/examples/js/helpers/AxesHelper.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
-    <script>
-        let scene, camera, renderer, controls, gui, overlay;
-        let points, corePoints, dynamicPoints;
-        let params = {
-            pointSize: 50,
-            coreOpacity: 1.0,
-            dynOpacity: 1.0,
-            showCore: true,
-            showDynamic: true,
-            backgroundColor: "#111111",
-            showAxes: true,
-            axesSize: 1,
-            useVertexColors: true,
-            tint: [255,255,255]
-        };
+  <div id="info">Hologram — Preprocessed Points • Initializing…</div>
+  <div id="container"></div>
+  <div id="progress" class="hidden">Loading…</div>
+  <div id="log"></div>
 
-        function log(msg) {
-            overlay.innerHTML += "<br/>" + msg;
-            console.log(msg);
+  <script type="module">
+    // ---------- status log ----------
+    const logEl=document.getElementById('log');
+    const progressEl=document.getElementById('progress');
+    const infoEl=document.getElementById('info');
+    const showProgress=(m)=>{ progressEl.textContent=m; progressEl.classList.remove('hidden'); };
+    const hideProgress=()=>progressEl.classList.add('hidden');
+    const log=(m,ok=true)=>{ const s=document.createElement('div'); s.className=ok?'ok':'bad'; s.textContent=(ok?'✓ ':'✗ ')+m; logEl.appendChild(s); console[ok?'log':'warn'](m); };
+    if (!HTMLScriptElement.supports?.('importmap')) log('Browser lacks importmap support', false);
+    log('boot');
+
+    // ---------- modules ----------
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { XRButton } from "three/addons/webxr/XRButton.js";
+    import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
+    import { OculusHandModel } from "three/addons/webxr/OculusHandModel.js";
+    import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+    log('modules ok');
+
+    // ---------- config ----------
+    const ASSET_BASE_URL=(window.ASSET_BASE_URL||'').trim();
+    const TRACK_ID=(window.TRACK_ID||'').trim();
+    const manifestUrl=`${ASSET_BASE_URL}/${TRACK_ID}/manifest.json`;
+
+    // ---------- capability detect ----------
+    let CAPS = { isWebGL2:false, vtf:false };
+    let USE_GPU = false; // decide after renderer exists
+    function detectCaps(renderer){
+      const gl = renderer.getContext();
+      const isWebGL2 = renderer.capabilities.isWebGL2 === true;
+      let maxVTF = 0;
+      try { maxVTF = gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0; } catch {}
+      return { isWebGL2, vtf: (isWebGL2 && maxVTF > 0) || maxVTF > 0 };
+    }
+
+    // ---------- globals ----------
+    let scene,camera,renderer,controls,mainScene,axesHelper=null;
+    let corePoints=null,coreMat=null,dynPoints=null,dynMat=null;
+    let header=null,posBuf=null,colBuf=null;
+    let numFrames=0,fps=8,numPoints=0;
+    let qOff=new THREE.Vector3(), qScale=new THREE.Vector3();
+    let stridePos=0,strideCol=0;
+    let dtPos=null,dtCol=null,tmpPosF32=null; // GPU textures
+
+    // CPU animated baseline buffers/attrs
+    let dynPosAttr=null, dynColAttr=null;
+    let dynPosArray=null, dynColArray=null; // Float32Array we mutate per frame
+    let selectedIdx = null; // decimation map (indices to keep)
+
+    // params
+    const params={ size:6, coreSize:6, coreOpacity:1.0, dynOpacity:1.0 };
+    const quality={ density:1.0, maxFPS:60 };
+    const playback={ play:true, frame:0 };
+    const colorsCfg = { useVertexColors:false, tint:[255,255,255], coreUseVertex:true, coreTint:[255,255,255] };
+    const bg = { color:[0,0,0] };
+    const mode = { path:'auto' }; // 'auto' | 'gpu' | 'cpu'
+    const axesCfg = { showAxes:false, size:1.0 };
+
+    // ---------- utils ----------
+    async function j(url){ showProgress('Fetching '+url); const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
+    async function b(url){ showProgress('Fetching '+url); const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${url}`); return r.arrayBuffer(); }
+    const done=()=>hideProgress();
+
+    function f16_to_f32(h){ const s=(h&0x8000)>>15,e=(h&0x7C00)>>10,f=h&0x03FF;
+      if(!e) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
+      if(e===31) return f?NaN:((s?-1:1)*Infinity);
+      return (s?-1:1)*Math.pow(2,e-15)*(1+f/1024);
+    }
+    function convertF16Block(u16,out){ for(let i=0;i<u16.length;i++) out[i]=f16_to_f32(u16[i]); return out; }
+
+    function texRGBA32F_fromRGBArray(arr,count){
+      const rgba=new Float32Array(count*4);
+      for(let i=0,j=0;i<count*3;i+=3,j+=4){ rgba[j]=arr[i]; rgba[j+1]=arr[i+1]; rgba[j+2]=arr[i+2]; rgba[j+3]=1.0; }
+      const t=new THREE.DataTexture(rgba,count,1,THREE.RGBAFormat,THREE.FloatType);
+      t.needsUpdate=true; t.magFilter=t.minFilter=THREE.NearestFilter; t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping; return t;
+    }
+    function idsGeom(n){
+      const g=new THREE.BufferGeometry();
+      const ids=new Float32Array(n); for(let i=0;i<n;i++) ids[i]=i;
+      g.setAttribute('a_id',new THREE.BufferAttribute(ids,1));
+      const pos=new Float32Array(n*3); g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+      return g;
+    }
+    function fitCameraToObject(obj,pad=1.3){
+      obj.geometry.computeBoundingSphere?.();
+      const bs=obj.geometry.boundingSphere;
+      if(!bs){ log('no bounding sphere',false); return; }
+      const r=bs.radius*pad;
+      camera.position.set(bs.center.x,bs.center.y,bs.center.z + r*2.8);
+      camera.near=Math.max(0.01,r/100); camera.far=r*25; camera.updateProjectionMatrix();
+      controls.target.copy(bs.center);
+      log(`camera fit r=${r.toFixed(2)}`);
+    }
+    // Round sprite for PointsMaterial
+    function circleSprite(size=64){
+      const c=document.createElement('canvas'); c.width=c.height=size;
+      const g=c.getContext('2d'); g.clearRect(0,0,size,size);
+      g.beginPath(); g.arc(size/2,size/2,size*0.48,0,Math.PI*2); g.closePath(); g.fillStyle='white'; g.fill();
+      const tx = new THREE.CanvasTexture(c);
+      tx.magFilter = tx.minFilter = THREE.LinearFilter;
+      tx.wrapS = tx.wrapT = THREE.ClampToEdgeWrapping;
+      return tx;
+    }
+    const DISC_TEX = circleSprite();
+
+    // ---------- shaders (GPU dynamic) ----------
+    const dynVS=`attribute float a_id; uniform sampler2D u_positions; uniform vec3 u_off,u_scale; uniform float u_size,u_n; varying float v_id;
+      void main(){ float u=(a_id+0.5)/u_n; vec3 pN=texture2D(u_positions,vec2(u,0.5)).rgb; vec3 p=u_off+u_scale*pN;
+      vec4 v=viewMatrix*vec4(p,1.0); gl_Position=projectionMatrix*v; float s=length(vec3(modelMatrix[0])); gl_PointSize=u_size*s*(1.0/-v.z); v_id=a_id; }`;
+    const dynFS=`uniform sampler2D u_colors; uniform float u_n,u_opacity; uniform vec3 u_tint; uniform float u_useVertex; varying float v_id;
+      void main(){ if(length(gl_PointCoord-vec2(0.5))>0.5) discard; 
+        float u=(v_id+0.5)/u_n; 
+        vec3 c = (u_useVertex>0.5) ? texture2D(u_colors,vec2(u,0.5)).rgb : vec3(1.0);
+        c *= u_tint;
+        gl_FragColor=vec4(c,u_opacity); }`;
+
+    // ---------- scene ----------
+    function setupScene(){
+      const container=document.getElementById('container');
+      scene=new THREE.Scene();
+      camera=new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 1e6);
+      camera.position.set(0,0,3);
+      renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+      renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth,innerHeight);
+      renderer.xr.enabled=true; renderer.setClearColor(0x000000,1);
+      container.appendChild(renderer.domElement);
+      controls=new OrbitControls(camera,renderer.domElement);
+      controls.enableDamping=true; controls.dampingFactor=0.05;
+
+      // caps & path
+      CAPS = detectCaps(renderer);
+      USE_GPU = CAPS.vtf; // default by capability
+
+      // Optional URL override: ?force=cpu | ?force=gpu
+      try {
+        const q = new URLSearchParams(location.search);
+        const f = (q.get('force')||'').toLowerCase();
+        if (f === 'cpu') {
+          USE_GPU = false;
+          log('force=cpu active');
+        } else if (f === 'gpu') {
+          if (!CAPS.vtf) { log('force=gpu requested but VTF not available — falling back to CPU', false); USE_GPU=false; }
+          else { USE_GPU = true; log('force=gpu active'); }
         }
+      } catch (e) { /* ignore */ }
 
-        function init() {
-            overlay = document.getElementById('overlay');
-            log("boot");
+      infoEl.textContent = `Hologram — Preprocessed Points • ${USE_GPU ? 'GPU' : 'CPU'} path`;
+      log(`caps: webgl2=${CAPS.isWebGL2} vtf=${CAPS.vtf}`);
+      log(USE_GPU ? 'using GPU texture path' : 'using CPU baseline path');
 
-            scene = new THREE.Scene();
-            scene.background = new THREE.Color(params.backgroundColor);
+      // XR (present but optional)
+      document.body.appendChild(XRButton.createButton(renderer,{requiredFeatures:[]}));
+      const xmf=new XRControllerModelFactory(); const g1=renderer.xr.getControllerGrip(0); g1.add(xmf.createControllerModel(g1)); scene.add(g1);
+      const g2=renderer.xr.getControllerGrip(1); g2.add(xmf.createControllerModel(g2)); scene.add(g2);
+      const h1=renderer.xr.getHand(0); h1.add(new OculusHandModel(h1)); scene.add(h1);
+      const h2=renderer.xr.getHand(1); h2.add(new OculusHandModel(h2)); scene.add(h2);
 
-            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
-            camera.position.z = 5;
+      mainScene=new THREE.Object3D(); scene.add(mainScene);
+      addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+    }
 
-            renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            document.body.appendChild(renderer.domElement);
+    // ---------- GUI ----------
+    function setupGUI() {
+      const gui = new dat.GUI();
 
-            controls = new THREE.OrbitControls(camera, renderer.domElement);
+      // Background
+      gui.addColor(bg, 'color').name('Background').onChange(rgb=>{
+        const c = (rgb.length) ? (rgb[0]<<16) + (rgb[1]<<8) + rgb[2] : 0x000000;
+        renderer.setClearColor(c,1);
+      });
 
-            const geometry = new THREE.BufferGeometry();
-            const count = 200;
-            const positions = new Float32Array(count * 3);
-            const colors = new Float32Array(count * 3);
-            for (let i = 0; i < count; i++) {
-                positions[i * 3] = (Math.random() - 0.5) * 2;
-                positions[i * 3 + 1] = (Math.random() - 0.5) * 2;
-                positions[i * 3 + 2] = (Math.random() - 0.5) * 2;
+      // Sizes & opacities
+      gui.add(params, "size", 1, 200).name("Point Size").onChange(v => {
+        if (coreMat?.isShaderMaterial) coreMat.uniforms.u_size.value = v;
+        if (dynMat?.isShaderMaterial)  dynMat .uniforms.u_size.value = v;
+        if (coreMat?.isPointsMaterial) coreMat.size = params.coreSize; // core uses its own size
+        if (dynMat ?.isPointsMaterial) dynMat .size = v;
+      });
+      gui.add(params, "coreSize", 1, 200).name("Core Size").onChange(v=>{
+        if (coreMat?.isPointsMaterial) coreMat.size = v;
+      });
+      gui.add(params, "coreOpacity", 0.0, 1.0).name("coreOpacity").onChange(v => {
+        if (coreMat?.isPointsMaterial){ coreMat.opacity = v; coreMat.transparent=true; coreMat.depthWrite=false; coreMat.needsUpdate=true; }
+      });
+      gui.add(params, "dynOpacity", 0.0, 1.0).name("dynOpacity").onChange(v => {
+        if (dynMat?.isShaderMaterial) dynMat.uniforms.u_opacity.value = v;
+        if (dynMat?.isPointsMaterial){ dynMat.opacity=v; dynMat.transparent=true; dynMat.depthWrite=false; dynMat.needsUpdate=true; }
+      });
 
-                colors[i * 3] = Math.random();
-                colors[i * 3 + 1] = Math.random();
-                colors[i * 3 + 2] = Math.random();
-            }
-            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      // Visibility
+      const visFolder = gui.addFolder("Visibility");
+      const vis = { core:true, dynamic:true };
+      visFolder.add(vis, "core").onChange(v => { if (corePoints) corePoints.visible = v; });
+      visFolder.add(vis, "dynamic").onChange(v => { if (dynPoints)  dynPoints.visible  = v; });
+      visFolder.open();
 
-            const material = new THREE.PointsMaterial({
-                size: params.pointSize / 100,
-                vertexColors: params.useVertexColors,
-                opacity: params.dynOpacity,
-                transparent: true
-            });
+      // Colors
+      const colFolder = gui.addFolder("Color");
+      colFolder.add(colorsCfg, "useVertexColors").name("Use Vertex Colors").onChange(v=>{
+        if (dynMat ?.isPointsMaterial) { dynMat .vertexColors = v; dynMat .needsUpdate = true; }
+        if (dynMat ?.isShaderMaterial)  { dynMat.uniforms.u_useVertex.value = v ? 1.0 : 0.0; }
+      });
+      colFolder.addColor(colorsCfg, "tint").name("Tint").onChange(rgb=>{
+        const c = new THREE.Color(rgb[0]/255, rgb[1]/255, rgb[2]/255);
+        if (dynMat ?.isPointsMaterial) dynMat .color.copy(c);
+        if (dynMat ?.isShaderMaterial)  dynMat.uniforms.u_tint.value.copy(c);
+      });
+      colFolder.add(colorsCfg, "coreUseVertex").name("Core Use Vertex").onChange(v=>{
+        if (coreMat?.isPointsMaterial){ coreMat.vertexColors = v; coreMat.needsUpdate = true; }
+      });
+      colFolder.addColor(colorsCfg, "coreTint").name("Core Tint").onChange(rgb=>{
+        const c = new THREE.Color(rgb[0]/255, rgb[1]/255, rgb[2]/255);
+        if (coreMat?.isPointsMaterial){ coreMat.color.copy(c); }
+      });
+      colFolder.open();
 
-            points = new THREE.Points(geometry, material);
-            scene.add(points);
+      // Quality
+      const qFolder = gui.addFolder("Quality");
+      qFolder.add(quality, "density", { "25%":0.25, "50%":0.5, "100%":1.0 }).name("Density").onChange(()=>rebuildDynamicGeometry());
+      qFolder.add(quality, "maxFPS", { "15":15, "30":30, "60":60 }).name("Max FPS");
+      qFolder.open();
 
-            if (params.showAxes) {
-                const axesHelper = new THREE.AxesHelper(params.axesSize);
-                scene.add(axesHelper);
-            }
+      // Playback
+      const pbFolder = gui.addFolder("Playback");
+      pbFolder.add(playback, "play").name("Play/Pause");
+      pbFolder.add({ next:()=>{ if (header) { playback.play=false; playback.frame = (playback.frame+1)%numFrames; } }}, "next").name("Next Frame");
+      pbFolder.add({ prev:()=>{ if (header) { playback.play=false; playback.frame = (playback.frame-1+numFrames)%numFrames; } }}, "prev").name("Prev Frame");
+      pbFolder.open();
 
-            gui = new dat.GUI();
-            gui.add(params, 'pointSize', 1, 200).onChange(v => {
-                points.material.size = v / 100;
-            });
-            gui.add(params, 'dynOpacity', 0, 1).onChange(v => {
-                points.material.opacity = v;
-            });
-            gui.addColor(params, 'backgroundColor').onChange(v => {
-                scene.background = new THREE.Color(v);
-            });
-            gui.add(params, 'showAxes').onChange(v => {
-                scene.children.forEach(obj => {
-                    if (obj.type === "AxesHelper") obj.visible = v;
-                });
-            });
-            gui.add(params, 'axesSize', 0.1, 5).onChange(v => {
-                scene.children.forEach(obj => {
-                    if (obj.type === "AxesHelper") obj.scale.set(v, v, v);
-                });
-            });
+      // Mode switcher (runtime)
+      gui.add(mode, 'path', { 'Auto':'auto','GPU':'gpu','CPU':'cpu' }).name('Mode').onChange(async val=>{
+        await switchMode(val);
+      });
 
-            window.addEventListener('resize', onWindowResize);
+      // Axes helper
+      const axesFolder = gui.addFolder("Axes");
+      axesFolder.add(axesCfg, 'showAxes').name('Show XYZ').onChange(v=>toggleAxes(v));
+      axesFolder.add(axesCfg, 'size', 0.1, 5.0).name('Size').onChange(v=>{ if(axesHelper){ axesHelper.scale.setScalar(v); }});
+      axesFolder.open();
+
+      // hide/show GUI with 'g'
+      window.addEventListener("keydown", e => { if (e.key.toLowerCase() === "g") document.querySelector('.dg.ac').classList.toggle("hidden"); });
+    }
+
+    // ---------- loaders ----------
+    async function loadCore(m){
+      if (!m.staticCore?.url) return null;
+      const url=`${ASSET_BASE_URL}/${TRACK_ID}/${m.staticCore.url}`;
+      showProgress('Loading core PLY…');
+      const ab=await b(url); done();
+      const inflated=pako.inflate(new Uint8Array(ab));
+      const text=new TextDecoder().decode(inflated);  // ASCII PLY
+      const g=new PLYLoader().parse(text);
+
+      // Ensure float colors if present, else default white
+      const ca=g.getAttribute('color');
+      if(ca && ca.array instanceof Uint8Array){
+        const n=ca.count; const f=new Float32Array(n*3);
+        for(let i=0;i<n*3;i++) f[i]=ca.array[i]/255;
+        g.setAttribute('color',new THREE.BufferAttribute(f,3));
+      } else if(!ca){
+        const n=g.getAttribute('position').count; const ones=new Float32Array(n*3); ones.fill(1);
+        g.setAttribute('color',new THREE.BufferAttribute(ones,3));
+      }
+
+      coreMat = new THREE.PointsMaterial({
+        size: params.coreSize, sizeAttenuation:true,
+        vertexColors: colorsCfg.coreUseVertex,
+        opacity: params.coreOpacity, transparent:true, depthWrite:false,
+        map: DISC_TEX, alphaTest: 0.5, color: new THREE.Color(colorsCfg.coreTint[0]/255, colorsCfg.coreTint[1]/255, colorsCfg.coreTint[2]/255)
+      });
+      const pts=new THREE.Points(g,coreMat); pts.frustumCulled=false;
+      return pts;
+    }
+
+    function buildSelectedIdx(){
+      const step = Math.max(1, Math.floor(1/quality.density));
+      const idx = [];
+      for (let i=0;i<numPoints;i+=step) idx.push(i);
+      selectedIdx = idx;
+    }
+
+    async function loadChunk(path){
+      showProgress('Loading header…');
+      header = await j(`${ASSET_BASE_URL}/${TRACK_ID}/${path}header.json`); done();
+      const {numFrames:fN=0,fps:fpsIn=8,numPoints:nPts=0,quant}=header;
+      numFrames=fN; fps=fpsIn; numPoints=nPts;
+      qOff.set(...quant.offset); qScale.set(...quant.scale);
+
+      // Fetch buffers
+      showProgress('Loading positions & colors…');
+      const [pb,cb]=await Promise.all([
+        b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}positions.bin`),
+        b(`${ASSET_BASE_URL}/${TRACK_ID}/${path}colors.bin`)
+      ]); done();
+      posBuf=pb; colBuf=cb;
+      stridePos=numPoints*3*2; strideCol=numPoints*3;
+      tmpPosF32=new Float32Array(numPoints*3);
+
+      // Validation
+      const expectPos = numFrames * numPoints * 3 * 2;
+      const expectCol = numFrames * numPoints * 3;
+      if (posBuf.byteLength !== expectPos) log(`positions size mismatch (${posBuf.byteLength} vs ${expectPos})`, false);
+      if (colBuf.byteLength !== expectCol) log(`colors size mismatch (${colBuf.byteLength} vs ${expectCol})`, false);
+
+      // Decide initial arrays & objects
+      if (USE_GPU) {
+        return buildDynGPU();
+      } else {
+        return buildDynCPU(true);
+      }
+    }
+
+    function buildDynGPU(){
+      const geom=idsGeom(numPoints);
+      dynMat=new THREE.ShaderMaterial({
+        uniforms:{
+          u_positions:{value:null}, u_colors:{value:null},
+          u_off:{value:qOff}, u_scale:{value:qScale},
+          u_size:{value:params.size}, u_n:{value:numPoints}, u_opacity:{value:params.dynOpacity},
+          u_tint:{value:new THREE.Color(colorsCfg.tint[0]/255, colorsCfg.tint[1]/255, colorsCfg.tint[2]/255)},
+          u_useVertex:{value: colorsCfg.useVertexColors ? 1.0 : 0.0}
+        },
+        vertexShader: dynVS, fragmentShader: dynFS, transparent:true, depthWrite:false
+      });
+      dynPoints=new THREE.Points(geom,dynMat); dynPoints.frustumCulled=false;
+      updateFrameTextures(0);
+      dynMat.uniforms.u_positions.value=dtPos;
+      dynMat.uniforms.u_colors.value   =dtCol;
+      return dynPoints;
+    }
+
+    function buildDynCPU(initFrame=false){
+      buildSelectedIdx(); // based on density
+      const geom = new THREE.BufferGeometry();
+      const N = selectedIdx.length;
+      dynPosArray = new Float32Array(N*3);
+      dynColArray = new Float32Array(N*3);
+
+      // Fill first/current frame
+      const fi = initFrame ? 0 : currentFrameIndex();
+      const u16 = new Uint16Array(posBuf, fi*stridePos, numPoints*3);
+      for (let k=0;k<N;k++){
+        const i = selectedIdx[k];
+        const base = i*3;
+        for (let a=0;a<3;a++){
+          const n = f16_to_f32(u16[base+a]);
+          dynPosArray[k*3+a] = qOff.getComponent(a) + qScale.getComponent(a) * n;
         }
+      }
+      const u8 = new Uint8Array(colBuf, fi*strideCol, numPoints*3);
+      let maxC=0;
+      for (let k=0;k<N;k++){
+        const i = selectedIdx[k];
+        const base = i*3;
+        const r=u8[base+0], g=u8[base+1], b=u8[base+2];
+        dynColArray[k*3+0] = r/255;
+        dynColArray[k*3+1] = g/255;
+        dynColArray[k*3+2] = b/255;
+        if (r>maxC||g>maxC||b>maxC) maxC=Math.max(maxC,r,g,b);
+      }
 
-        function onWindowResize() {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
+      // Auto color fallback if too dark
+      if (maxC < 5 && !colorsCfg.useVertexColors){
+        log('colors look empty; using tint (vertex colors OFF)', true);
+      }
+
+      dynPosAttr = new THREE.BufferAttribute(dynPosArray, 3);
+      dynColAttr = new THREE.BufferAttribute(dynColArray, 3);
+      geom.setAttribute('position', dynPosAttr);
+      geom.setAttribute('color', dynColAttr);
+
+      dynMat = new THREE.PointsMaterial({
+        size: params.size, sizeAttenuation:true,
+        vertexColors:true, opacity: params.dynOpacity, transparent:true, depthWrite:false,
+        map: DISC_TEX, alphaTest: 0.5, color: new THREE.Color(colorsCfg.tint[0]/255, colorsCfg.tint[1]/255, colorsCfg.tint[2]/255)
+      });
+      dynPoints = new THREE.Points(geom, dynMat);
+      dynPoints.frustumCulled = false;
+
+      // CPU guardrails for huge point counts
+      if (selectedIdx.length > 250000){
+        quality.density = 0.5; quality.maxFPS = 30; rebuildDynamicGeometry();
+        log('CPU mode: auto density 50% & 30 FPS for stability');
+      }
+
+      return dynPoints;
+    }
+
+    function destroyDynamic(){
+      if (!dynPoints) return;
+      mainScene.remove(dynPoints);
+      dynPoints.geometry.dispose();
+      if (dynMat?.dispose) dynMat.dispose();
+      dynPoints=null; dynMat=null;
+      if (dtPos){ dtPos.dispose(); dtPos=null; }
+      if (dtCol){ dtCol.dispose(); dtCol=null; }
+    }
+
+    async function switchMode(val){
+      let target = val;
+      if (val==='auto') target = CAPS.vtf ? 'gpu' : 'cpu';
+      const wantGPU = (target==='gpu');
+      if (wantGPU && !CAPS.vtf){ log('GPU mode requested but VTF unsupported — staying CPU', false); return; }
+
+      USE_GPU = wantGPU;
+      infoEl.textContent = `Hologram — Preprocessed Points • ${USE_GPU ? 'GPU' : 'CPU'} path`;
+
+      if (!header){ log('mode switch queued (assets not loaded yet)', true); return; }
+
+      destroyDynamic();
+      const obj = USE_GPU ? buildDynGPU() : buildDynCPU(false);
+      mainScene.add(obj);
+      log(`switched to ${USE_GPU?'GPU':'CPU'} path`);
+    }
+
+    function updateFrameTextures(i){
+      const u16=new Uint16Array(posBuf, i*stridePos, numPoints*3);
+      const u8 =new Uint8Array (colBuf, i*strideCol, numPoints*3);
+      convertF16Block(u16,tmpPosF32);
+      if(!dtPos) dtPos=texRGBA32F_fromRGBArray(tmpPosF32,numPoints);
+      else {
+        const rgba=dtPos.image.data;
+        for(let p=0,q=0;p<numPoints*3;p+=3,q+=4){ rgba[q]=tmpPosF32[p]; rgba[q+1]=tmpPosF32[p+1]; rgba[q+2]=tmpPosF32[p+2]; rgba[q+3]=1.0; }
+        dtPos.needsUpdate=true;
+      }
+      if(!dtCol){
+        dtCol=new THREE.DataTexture(new Uint8Array(u8),numPoints,1,THREE.RGBFormat,THREE.UnsignedByteType);
+        dtCol.needsUpdate=true; dtCol.magFilter=dtCol.minFilter=THREE.NearestFilter; dtCol.wrapS=dtCol.wrapT=THREE.ClampToEdgeWrapping;
+      } else {
+        dtCol.image.data.set(new Uint8Array(u8)); dtCol.needsUpdate=true;
+      }
+    }
+
+    function rebuildDynamicGeometry(){
+      if (!header || !dynPoints) return;
+      if (USE_GPU) {
+        const n = Math.max(1, Math.floor(numPoints * quality.density));
+        const ids = new Float32Array(n);
+        const pos = new Float32Array(n*3); // dummy
+        const step = Math.max(1, Math.floor(numPoints / n));
+        for (let k=0,i=0; k<n; k++, i+=step) ids[k] = i % numPoints;
+        dynPoints.geometry.setAttribute('a_id', new THREE.BufferAttribute(ids,1));
+        dynPoints.geometry.setAttribute('position', new THREE.BufferAttribute(pos,3));
+        if (dynMat?.isShaderMaterial) dynMat.uniforms.u_n.value = n;
+        log(`GPU density: ${n}/${numPoints}`);
+      } else {
+        // CPU baseline
+        buildSelectedIdx();
+        const N = selectedIdx.length;
+        dynPosArray = new Float32Array(N*3);
+        dynColArray = new Float32Array(N*3);
+        dynPosAttr = new THREE.BufferAttribute(dynPosArray,3);
+        dynColAttr = new THREE.BufferAttribute(dynColArray,3);
+        dynPoints.geometry.setAttribute('position', dynPosAttr);
+        dynPoints.geometry.setAttribute('color', dynColAttr);
+        updateCPUFrame(currentFrameIndex());
+        log(`CPU density: ${N}/${numPoints}`);
+      }
+    }
+
+    // ---------- animation ----------
+    const clock=new THREE.Clock(); let last=0;
+    function nowSec(){ return performance.now()*0.001; }
+    function currentFrameIndex(){
+      if(!header) return 0;
+      if (!playback.play) return playback.frame|0;
+      const t = nowSec();
+      return Math.floor(t*Math.min(quality.maxFPS, fps)) % Math.max(1,numFrames);
+    }
+    function updateCPUFrame(fi){
+      if (!(dynPosAttr && dynColAttr)) return;
+      const N = selectedIdx.length;
+      const u16 = new Uint16Array(posBuf, fi*stridePos, numPoints*3);
+      for (let k=0;k<N;k++){
+        const i = selectedIdx[k]; const base=i*3;
+        for (let a=0;a<3;a++){
+          const n = f16_to_f32(u16[base+a]);
+          dynPosArray[k*3+a] = qOff.getComponent(a) + qScale.getComponent(a) * n;
         }
+      }
+      dynPosAttr.needsUpdate = true;
 
-        function animate() {
-            requestAnimationFrame(animate);
-            points.rotation.y += 0.002;
-            controls.update();
-            renderer.render(scene, camera);
+      const u8 = new Uint8Array(colBuf, fi*strideCol, numPoints*3);
+      for (let k=0;k<N;k++){
+        const i = selectedIdx[k]; const base=i*3;
+        dynColArray[k*3+0] = u8[base+0]/255;
+        dynColArray[k*3+1] = u8[base+1]/255;
+        dynColArray[k*3+2] = u8[base+2]/255;
+      }
+      dynColAttr.needsUpdate = true;
+    }
+
+    // ---------- axes helper ----------
+    function toggleAxes(show){
+      if (show && !axesHelper){
+        axesHelper = new THREE.AxesHelper(1);
+        axesHelper.scale.setScalar(axesCfg.size);
+        mainScene.add(axesHelper);
+      } else if (!show && axesHelper){
+        mainScene.remove(axesHelper);
+        axesHelper.geometry.dispose();
+        axesHelper.material.dispose();
+        axesHelper = null;
+      }
+    }
+
+    // ---------- boot ----------
+    (async function main(){
+      setupScene();
+      setupGUI();
+
+      log('fetch manifest...');
+      showProgress('Loading manifest…');
+      const manifest=await j(manifestUrl); done(); log('manifest ok');
+
+      log('load core...');
+      const core = await loadCore(manifest); done();
+      if (core){ corePoints = core; mainScene.add(corePoints); log(`core ok (${corePoints.geometry.getAttribute('position').count|0} pts)`); }
+
+      log('load first chunk...');
+      const dyn = await loadChunk(manifest.dynamic.chunks[0].path); done();
+      dynPoints = dyn; mainScene.add(dynPoints);
+      log(`chunk ok (${numPoints} dyn pts/frame @ ${fps} fps)`);
+
+      if (corePoints) fitCameraToObject(corePoints,1.3); else fitCameraToObject(dynPoints,1.3);
+
+      log('start loop');
+      renderer.setAnimationLoop(()=>{
+        controls.update();
+        if(header){
+          const fi = currentFrameIndex();
+          if (USE_GPU) {
+            updateFrameTextures(fi);
+            if(dynMat){ dynMat.uniforms.u_positions.value=dtPos; dynMat.uniforms.u_colors.value=dtCol; }
+          } else {
+            updateCPUFrame(fi);
+          }
         }
-
-        init();
-        animate();
-    </script>
+        renderer.render(scene,camera);
+      });
+    })().catch(err=>{
+      const d=document.getElementById('err')||document.body.appendChild(Object.assign(document.createElement('div'),{id:'err'}));
+      d.textContent='Init Error: '+(err.stack||err.message);
+      log('init failed: '+err.message,false);
+      console.error(err);
+    });
+  </script>
 </body>
 </html>
